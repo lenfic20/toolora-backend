@@ -16,4 +16,4 @@ database_id = "PASTE_DATABASE_ID_HERE"
 # Public value from Google Cloud Console. Leave empty to hide the Google button.
 GOOGLE_CLIENT_ID = ""
 # Public address of the FastAPI downloader, for example https://toolora-api.onrender.com
-BACKEND_URL = ""
+BACKEND_URL = "https://toolora-backend-thze.onrender.com"
