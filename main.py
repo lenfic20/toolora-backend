@@ -92,23 +92,42 @@ def clear_folder(folder: str) -> None:
                 pass
 
 
-def attempts_for(mode: str) -> list[dict]:
+def is_youtube(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return host == "youtube.com" or host.endswith(".youtube.com") or host == "youtu.be" or host.endswith(".youtu.be")
+
+
+def attempts_for(mode: str, url: str) -> list[dict]:
     if mode == "audio":
-        return [{
+        formats = [{
             "format": "bestaudio/best",
             "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}],
         }]
-    # Try the best quality first, then step down only if it is too big for the size cap.
-    steps = [{"format": "bv*+ba/b", "format_sort": SORT}]
-    for h in (1080, 720, 480):
-        steps.append({"format": f"bv*[height<={h}]+ba/b[height<={h}]", "format_sort": SORT})
-    # Some social posts are pictures rather than videos.
-    steps.append({"format": "best"})
-    return steps
+    else:
+        formats = [{"format": "bv*+ba/b", "format_sort": SORT},
+                   {"format": "bv*[height<=1080]+ba/b[height<=1080]", "format_sort": SORT},
+                   {"format": "bv*[height<=720]+ba/b[height<=720]", "format_sort": SORT},
+                   {"format": "bv*[height<=480]+ba/b[height<=480]", "format_sort": SORT},
+                   {"format": "best"}]
+    if not is_youtube(url):
+        return formats
+
+    # YouTube's extractor changes frequently. Try current clients in a deliberate order.
+    clients = ["tv", "android_vr", "web_embedded", "web_safari", "web"]
+    out = []
+    for client in clients:
+        for item in formats[:4 if mode == "video" else 1]:
+            x = dict(item)
+            x["extractor_args"] = {"youtube": {"player_client": [client]}}
+            x["remote_components"] = ["ejs:github"]
+            out.append(x)
+    # Final generic attempts let yt-dlp choose a newly supported client.
+    out.extend({**x, "remote_components": ["ejs:github"]} for x in formats)
+    return out
 
 
 def pick_file(folder: str, mode: str) -> str | None:
-    want = (".mp3",) if mode == "audio" else (".mp4", ".mkv", ".webm", ".mov", ".jpg", ".jpeg", ".png", ".webp", ".gif")
+    want = (".mp3",) if mode == "audio" else (".mp4", ".mkv", ".webm", ".mov")
     files = [f for f in os.listdir(folder) if f.lower().endswith(want) and not FRAGMENT.search(f)]
     if not files:
         return None
@@ -124,18 +143,25 @@ def fetch(url: str, folder: str, mode: str = "video") -> str:
         "max_filesize": MAX_MB * 1024 * 1024,
         "socket_timeout": 20,
         "quiet": True,
-        "no_warnings": True,
+        "no_warnings": False,
+        "retries": 3,
+        "fragment_retries": 3,
+        "remote_components": ["ejs:github"],
     }
     last = None
-    for extra in attempts_for(mode):
+    for extra in attempts_for(mode, url):
         clear_folder(folder)
         try:
             with yt_dlp.YoutubeDL({**base, **extra}) as ydl:
                 ydl.download([url])
         except yt_dlp.utils.DownloadError as e:
-            if mode == "audio" or "requested format" not in str(e).lower():
+            msg = str(e).lower()
+            if is_youtube(url) and any(x in msg for x in ("player response", "sign in to confirm", "requested format", "unable to extract", "http error 403", "forbidden")):
+                last = e
+                continue
+            if mode == "audio" or "requested format" not in msg:
                 raise
-            last = e  # that quality isn't offered; try the next step down
+            last = e
             continue
         path = pick_file(folder, mode)
         if path:
@@ -168,11 +194,11 @@ async def download(req: Req, request: Request):
             path = await asyncio.to_thread(fetch, req.url.strip(), folder, req.mode)
     except Exception as e:
         shutil.rmtree(folder, ignore_errors=True)
-        reason = ANSI.sub("", str(e)).removeprefix("ERROR: ")[:160]
+        reason = ANSI.sub("", str(e)).removeprefix("ERROR: ")[:260]
         what = "extract the audio from" if req.mode == "audio" else "download"
         raise HTTPException(422, f"Couldn't {what} that video: {reason}")
     ext = os.path.splitext(path)[1].lower()
-    media = {".mp3": "audio/mpeg", ".mp4": "video/mp4", ".webm": "video/webm", ".mkv": "video/x-matroska", ".mov": "video/quicktime", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp", ".gif": "image/gif"}.get(ext, "application/octet-stream")
+    media = {".mp3": "audio/mpeg", ".mp4": "video/mp4", ".webm": "video/webm", ".mkv": "video/x-matroska", ".mov": "video/quicktime"}.get(ext, "application/octet-stream")
     return FileResponse(path, media_type=media, filename=os.path.basename(path), background=cleanup)
 
 
