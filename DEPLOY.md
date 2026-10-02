@@ -20,3 +20,7 @@ After deployment, check:
 It should return `{"ok":true}`.
 
 Important limitation: no downloader can guarantee every YouTube/Instagram URL. Private, members-only, age-restricted, login-required, geo-blocked, or otherwise restricted media can require authentication/cookies or platform-specific tokens. Public supported URLs are what this backend is designed to fetch.
+
+
+### v14 fix
+The backend now uses the current yt-dlp Python API format for JavaScript runtimes (`js_runtimes` is a dict such as `{"deno": {}}`) and remote components (a set). This fixes the `Invalid js_runtimes format` error shown by the downloader. The existing YouTube/TikTok/Instagram/X download logic is otherwise preserved.

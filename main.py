@@ -119,10 +119,10 @@ def attempts_for(mode: str, url: str) -> list[dict]:
         for item in formats[:4 if mode == "video" else 1]:
             x = dict(item)
             x["extractor_args"] = {"youtube": {"player_client": [client]}}
-            x["remote_components"] = ["ejs:github", "ejs:npm"]
+            x["remote_components"] = {"ejs:github", "ejs:npm"}
             out.append(x)
     # Final generic attempts let yt-dlp choose a newly supported client.
-    out.extend({**x, "remote_components": ["ejs:github", "ejs:npm"]} for x in formats)
+    out.extend({**x, "remote_components": {"ejs:github", "ejs:npm"}} for x in formats)
     return out
 
 
@@ -146,8 +146,8 @@ def fetch(url: str, folder: str, mode: str = "video") -> str:
         "no_warnings": False,
         "retries": 3,
         "fragment_retries": 3,
-        "remote_components": ["ejs:github", "ejs:npm"],
-        "js_runtimes": ["deno"],
+        "remote_components": {"ejs:github", "ejs:npm"},
+        "js_runtimes": {"deno": {}},
         "http_headers": {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36",
             "Accept-Language": "en-US,en;q=0.9",
@@ -203,7 +203,7 @@ async def download(req: Req, request: Request):
         what = "extract the audio from" if req.mode == "audio" else "download"
         raise HTTPException(422, f"Couldn't {what} that video: {reason}")
     ext = os.path.splitext(path)[1].lower()
-    media = {".mp3": "audio/mpeg", ".mp4": "video/mp4", ".webm": "video/webm", ".mkv": "video/x-matroska", ".mov": "video/quicktime"}.get(ext, "application/octet-stream")
+    media = {".mp3": "audio/mpeg", ".mp4": "video/mp4", ".webm": "video/webm", ".mkv": "video/x-matroska", ".mov": "video/quicktime", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp", ".gif": "image/gif"}.get(ext, "application/octet-stream")
     return FileResponse(path, media_type=media, filename=os.path.basename(path), background=cleanup)
 
 
