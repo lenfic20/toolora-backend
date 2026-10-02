@@ -1,27 +1,22 @@
-# Toolora Render backend — YouTube build fix
+# Toolora downloader backend update
 
-The previous Dockerfile failed while running:
+This update is for the existing Render `toolora-backend` service.
 
-`curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh`
+It keeps the existing API and adds:
+- stronger YouTube extraction retries using current yt-dlp EJS/Deno support;
+- additional current YouTube player clients;
+- support for Instagram video/photo responses;
+- audio mode used by the updated Toolora frontend;
+- browser-friendly media headers;
+- continued support for YouTube, TikTok, Instagram and X.
 
-Render's build environment did not have `unzip` or `7z`, so the Deno installer exited with code 1.
+Replace the existing backend files with `Dockerfile`, `main.py`, and `requirements.txt`, then deploy the existing Render service.
 
-This version copies Deno directly from the official `denoland/deno:bin-2.9.7` image instead. Deno's official Docker documentation supports this binary-image approach, and yt-dlp's current EJS documentation recommends Deno for YouTube extraction.
+Use **Manual Deploy -> Clear build cache & deploy** if Render keeps an older image.
 
-## Deploy
-
-Replace the files in the Render backend repository/service with:
-
-- `Dockerfile`
-- `requirements.txt`
-- `main.py`
-
-Then trigger a new Render deploy with **Clear build cache & deploy** if that option is available.
-
-Do not create a new Render service. Keep the existing `toolora-backend` service and its environment variables.
-
-After deployment, open:
-
+After deployment, check:
 `https://toolora-backend-thze.onrender.com/health`
 
-It should return JSON containing `"ok": true`.
+It should return `{"ok":true}`.
+
+Important limitation: no downloader can guarantee every YouTube/Instagram URL. Private, members-only, age-restricted, login-required, geo-blocked, or otherwise restricted media can require authentication/cookies or platform-specific tokens. Public supported URLs are what this backend is designed to fetch.

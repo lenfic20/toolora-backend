@@ -30,7 +30,7 @@ PROXY_SECRET = os.getenv("PROXY_SECRET", "")
 slots = asyncio.Semaphore(int(os.getenv("MAX_CONCURRENT", "3")))
 
 # Only these sites (and their subdomains) are accepted; this also blocks SSRF to internal hosts.
-ALLOWED_HOSTS = ("youtube.com", "youtu.be", "tiktok.com", "instagram.com", "twitter.com", "x.com")
+ALLOWED_HOSTS = ("youtube.com", "youtu.be", "tiktok.com", "instagram.com", "instagr.am", "twitter.com", "x.com")
 
 app = FastAPI(title="Toolora backend")
 app.add_middleware(
@@ -113,21 +113,21 @@ def attempts_for(mode: str, url: str) -> list[dict]:
         return formats
 
     # YouTube's extractor changes frequently. Try current clients in a deliberate order.
-    clients = ["tv", "android_vr", "web_embedded", "web_safari", "web"]
+    clients = ["mweb", "ios", "android", "android_vr", "tv", "web_embedded", "web_safari", "web", "tv_embedded"]
     out = []
     for client in clients:
         for item in formats[:4 if mode == "video" else 1]:
             x = dict(item)
             x["extractor_args"] = {"youtube": {"player_client": [client]}}
-            x["remote_components"] = ["ejs:github"]
+            x["remote_components"] = ["ejs:github", "ejs:npm"]
             out.append(x)
     # Final generic attempts let yt-dlp choose a newly supported client.
-    out.extend({**x, "remote_components": ["ejs:github"]} for x in formats)
+    out.extend({**x, "remote_components": ["ejs:github", "ejs:npm"]} for x in formats)
     return out
 
 
 def pick_file(folder: str, mode: str) -> str | None:
-    want = (".mp3",) if mode == "audio" else (".mp4", ".mkv", ".webm", ".mov")
+    want = (".mp3",) if mode == "audio" else (".mp4", ".mkv", ".webm", ".mov", ".jpg", ".jpeg", ".png", ".webp", ".gif")
     files = [f for f in os.listdir(folder) if f.lower().endswith(want) and not FRAGMENT.search(f)]
     if not files:
         return None
@@ -146,7 +146,12 @@ def fetch(url: str, folder: str, mode: str = "video") -> str:
         "no_warnings": False,
         "retries": 3,
         "fragment_retries": 3,
-        "remote_components": ["ejs:github"],
+        "remote_components": ["ejs:github", "ejs:npm"],
+        "js_runtimes": ["deno"],
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
     }
     last = None
     for extra in attempts_for(mode, url):
@@ -156,11 +161,11 @@ def fetch(url: str, folder: str, mode: str = "video") -> str:
                 ydl.download([url])
         except yt_dlp.utils.DownloadError as e:
             msg = str(e).lower()
-            if is_youtube(url) and any(x in msg for x in ("player response", "sign in to confirm", "requested format", "unable to extract", "http error 403", "forbidden")):
+            if is_youtube(url) and any(x in msg for x in ("player response", "sign in to confirm", "requested format", "unable to extract", "http error 400", "http error 403", "http error 429", "forbidden", "po token", "javascript", "challenge")):
                 last = e
                 continue
-            if mode == "audio" or "requested format" not in msg:
-                raise
+            # Different public posts can expose different media formats. Keep trying the
+            # remaining extractor/format strategies before returning an error.
             last = e
             continue
         path = pick_file(folder, mode)
