@@ -10,7 +10,7 @@ Env vars (all optional):
   RATE_PER_MINUTE   requests per IP per minute (default 10)
   PROXY_SECRET      shared secret sent by the Toolora worker; when set, /download only accepts requests that carry it
 """
-import asyncio, hmac, os, re, shutil, tempfile, time
+import asyncio, hmac, os, re, shutil, tempfile, time, subprocess
 from typing import Literal
 from collections import defaultdict, deque
 from urllib.parse import urlparse
@@ -170,6 +170,25 @@ def fetch(url: str, folder: str, mode: str = "video") -> str:
             continue
         path = pick_file(folder, mode)
         if path:
+            if mode == "video":
+                ext = os.path.splitext(path)[1].lower()
+                if ext in (".webm", ".mkv", ".mov"):
+                    mp4 = os.path.join(folder, os.path.splitext(os.path.basename(path))[0] + ".mp4")
+                    try:
+                        subprocess.run(
+                            [
+                                "ffmpeg", "-y", "-i", path,
+                                "-map", "0:v:0", "-map", "0:a?",
+                                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                                "-c:a", "aac", "-b:a", "128k",
+                                "-movflags", "+faststart", mp4
+                            ],
+                            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180
+                        )
+                        if os.path.exists(mp4) and os.path.getsize(mp4) > 0:
+                            return mp4
+                    except (subprocess.SubprocessError, OSError):
+                        pass
             return path
     if last:
         raise last
