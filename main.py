@@ -12,6 +12,7 @@ Env vars (all optional):
   COOKIES_TXT       (optional) browser cookies in Netscape cookies.txt format. Lets Instagram/YouTube serve the server
                     like a logged-in browser, which fixes "login required" / "sign in to confirm" blocks.
                     Alternatives: COOKIES_B64 (the same file, base64-encoded) or a Render Secret File named cookies.txt
+  MAX_SECONDS       give up on a link after this many seconds of trying different methods (default 80)
   YTDLP_PROXY       (optional) proxy URL such as http://user:pass@host:port, used for every outgoing request
 """
 import asyncio, base64, hmac, html, os, re, shutil, subprocess, tempfile, time
@@ -34,6 +35,7 @@ MAX_MB = int(os.getenv("MAX_FILESIZE_MB", "200"))
 RATE = int(os.getenv("RATE_PER_MINUTE", "10"))
 PROXY_SECRET = os.getenv("PROXY_SECRET", "")
 OUT_PROXY = os.getenv("YTDLP_PROXY", "").strip()
+BUDGET = float(os.getenv("MAX_SECONDS", "80"))
 slots = asyncio.Semaphore(int(os.getenv("MAX_CONCURRENT", "3")))
 
 # Only these sites (and their subdomains) are accepted; this also blocks SSRF to internal hosts.
@@ -372,8 +374,7 @@ def attempts_for(mode: str, url: str) -> list[dict]:
             return [{"format": "b[ext=mp4]/bv*+ba/b", "format_sort": SORT}] + formats[1:]
         return formats
 
-    # YouTube's extractor changes frequently. Let yt-dlp's own up-to-date default clients go first,
-    # then try each other client once. One format chain per client keeps failures fast.
+    # YouTube's extractor changes frequently, so try each client once with one format chain (fast failures).
     if mode == "audio":
         chain = [formats[0]]
         tiers = []
@@ -382,10 +383,13 @@ def attempts_for(mode: str, url: str) -> list[dict]:
         tiers = [{"format": "bv*[height<=720]+ba/b[height<=720]", "format_sort": YT_SORT, "_lower": True},
                  {"format": "bv*[height<=480]+ba/b[height<=480]", "format_sort": YT_SORT, "_lower": True},
                  {"format": "best", "_lower": True}]
-    clients = ["web_safari", "mweb", "tv", "android_vr", "web_embedded", "ios", "android", "visionos", "tv_simply", "web"]
-    out = [{**chain[0], "remote_components": ["ejs:github"]}]
+    # Clients that need no JavaScript challenge solving go first: they answer in a second or two even on a small
+    # server, while the web clients can take a minute there. yt-dlp's own default mix goes last as the catch-all.
+    clients = ["android_vr", "visionos", "tv", "web_safari", "mweb", "web_embedded", "ios", "android", "tv_simply", "web"]
+    out = []
     for client in clients:
         out.append({**chain[0], "extractor_args": {"youtube": {"player_client": [client]}}, "remote_components": ["ejs:github"]})
+    out.append({**chain[0], "remote_components": ["ejs:github"]})
     out.extend({**t, "remote_components": ["ejs:github"]} for t in tiers)  # smaller versions, used if the big one is over the size cap
     return out
 
@@ -417,6 +421,8 @@ def fetch(url: str, folder: str, mode: str = "video") -> str:
     }
     if OUT_PROXY:
         base["proxy"] = OUT_PROXY
+    if is_youtube(url):
+        base.update({"retries": 1, "fragment_retries": 2, "socket_timeout": 15})
     cookie_path = None
     if COOKIES:
         fd, cookie_path = tempfile.mkstemp(prefix="ck_", suffix=".txt")  # yt-dlp rewrites its cookie file, so give it a private copy
@@ -431,7 +437,10 @@ def fetch(url: str, folder: str, mode: str = "video") -> str:
     last = None
     try:
         capped = False  # a download that finished without a file means the size cap was hit
+        started, blocked = time.monotonic(), 0
         for extra in attempts_for(mode, url):
+            if last is not None and time.monotonic() - started > BUDGET:
+                break  # stop trying new methods; the visitor gets the last reason instead of an endless spinner
             lower = bool(extra.get("_lower"))
             extra = {k: v for k, v in extra.items() if k != "_lower"}
             if capped and not lower and is_youtube(url):
@@ -452,6 +461,10 @@ def fetch(url: str, folder: str, mode: str = "video") -> str:
                 if is_youtube(url):
                     if any(x in msg for x in YT_FINAL):
                         raise  # private / removed / copyright: no other client can help
+                    if "sign in to confirm" in msg or "not a bot" in msg:
+                        blocked += 1
+                        if blocked >= 4:
+                            raise  # YouTube is blocking this server's address; more clients won't change that
                     continue
                 if mode == "audio" or "requested format" not in msg:
                     raise
