@@ -21,15 +21,13 @@ WORKDIR /app
 
 COPY requirements.txt .
 
-# yt-dlp[default] includes the matching yt-dlp-ejs package needed by current
-# YouTube extraction. The curl-cffi extra is REQUIRED for Instagram (and helps
-# TikTok): current yt-dlp reads Instagram by impersonating a real browser, which
-# only works when curl-cffi is installed. The second command upgrades only the
-# yt-dlp package itself to its newest nightly build (no pre-release dependencies),
-# because Instagram/TikTok/YouTube fixes land there first.
-RUN pip install --no-cache-dir -U "yt-dlp[default,curl-cffi]" fastapi "uvicorn[standard]" \
-    && pip install --no-cache-dir -U --pre --no-deps yt-dlp \
-    && python -c "import yt_dlp, curl_cffi; print('yt-dlp', yt_dlp.version.__version__, '| curl_cffi', curl_cffi.__version__)"
+# Install order matters. First the newest yt-dlp nightly build on its own (nightlies get Instagram/TikTok/
+# YouTube fixes first). Then its dependencies WITHOUT -U, so pip keeps that nightly and installs the exact
+# yt-dlp-ejs version it was built against (YouTube's challenge solver must match) plus curl-cffi, which
+# current yt-dlp needs to read Instagram by impersonating a real browser.
+RUN pip install --no-cache-dir -U --pre --no-deps yt-dlp \
+    && pip install --no-cache-dir "yt-dlp[default,curl-cffi]" fastapi "uvicorn[standard]" \
+    && python -c "import yt_dlp, yt_dlp_ejs, curl_cffi; print('yt-dlp', yt_dlp.version.__version__, '| ejs', yt_dlp_ejs.version, '| curl_cffi', curl_cffi.__version__)"
 
 COPY main.py .
 

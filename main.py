@@ -83,7 +83,9 @@ def valid_url(u: str) -> bool:
 
 
 SORT = ["res", "ext:mp4:m4a"]  # best resolution, preferring MP4/M4A so the result plays on phones
+YT_SORT = ["res:1080", "vcodec:h264", "acodec:aac", "ext:mp4:m4a"]  # YouTube: up to 1080p, phone-friendly codecs
 FRAGMENT = re.compile(r"\.f[\w-]+\.[A-Za-z0-9]+$")  # intermediate streams such as "name.f137.mp4"
+YT_FINAL = ("private video", "has been removed", "been terminated", "copyright", "members-only", "members only", "join this channel", "live event will begin", "premieres in", "unsupported url", "is not a valid url", "video has been deleted")
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 
@@ -218,6 +220,10 @@ def clean_error(e: BaseException) -> str:
     if not msg:
         msg = ("the site didn't return a playable file. The post may be private, deleted or restricted, "
                "or the site is temporarily blocking the server. Please try again in a moment.")
+    low = msg.lower()
+    if "sign in to confirm" in low and "bot" in low:
+        msg = ("YouTube is refusing this server's connection right now (it asked to confirm the visitor is not a bot). "
+               "Please try again in a few minutes.")
     return msg[:360]
 
 
@@ -366,17 +372,21 @@ def attempts_for(mode: str, url: str) -> list[dict]:
             return [{"format": "b[ext=mp4]/bv*+ba/b", "format_sort": SORT}] + formats[1:]
         return formats
 
-    # YouTube's extractor changes frequently. Try current clients in a deliberate order.
-    clients = ["tv", "android_vr", "web_embedded", "web_safari", "web"]
-    out = []
+    # YouTube's extractor changes frequently. Let yt-dlp's own up-to-date default clients go first,
+    # then try each other client once. One format chain per client keeps failures fast.
+    if mode == "audio":
+        chain = [formats[0]]
+        tiers = []
+    else:
+        chain = [{"format": "bv*+ba/b", "format_sort": YT_SORT}]  # best up to 1080p, H.264 + AAC, so it plays everywhere and stays under the size cap
+        tiers = [{"format": "bv*[height<=720]+ba/b[height<=720]", "format_sort": YT_SORT, "_lower": True},
+                 {"format": "bv*[height<=480]+ba/b[height<=480]", "format_sort": YT_SORT, "_lower": True},
+                 {"format": "best", "_lower": True}]
+    clients = ["web_safari", "mweb", "tv", "android_vr", "web_embedded", "ios", "android", "visionos", "tv_simply", "web"]
+    out = [{**chain[0], "remote_components": ["ejs:github"]}]
     for client in clients:
-        for item in formats[:4 if mode == "video" else 1]:
-            x = dict(item)
-            x["extractor_args"] = {"youtube": {"player_client": [client]}}
-            x["remote_components"] = ["ejs:github"]
-            out.append(x)
-    # Final generic attempts let yt-dlp choose a newly supported client.
-    out.extend({**x, "remote_components": ["ejs:github"]} for x in formats)
+        out.append({**chain[0], "extractor_args": {"youtube": {"player_client": [client]}}, "remote_components": ["ejs:github"]})
+    out.extend({**t, "remote_components": ["ejs:github"]} for t in tiers)  # smaller versions, used if the big one is over the size cap
     return out
 
 
@@ -420,7 +430,14 @@ def fetch(url: str, folder: str, mode: str = "video") -> str:
     insta = is_instagram(url)
     last = None
     try:
+        capped = False  # a download that finished without a file means the size cap was hit
         for extra in attempts_for(mode, url):
+            lower = bool(extra.get("_lower"))
+            extra = {k: v for k, v in extra.items() if k != "_lower"}
+            if capped and not lower and is_youtube(url):
+                continue  # too big: jump straight to the smaller versions
+            if lower and not capped and "requested format" not in str(last or "").lower():
+                continue  # smaller versions only help with size or format problems, not with blocks
             clear_folder(folder)
             try:
                 with yt_dlp.YoutubeDL({**base, **extra}) as ydl:
@@ -432,7 +449,9 @@ def fetch(url: str, folder: str, mode: str = "video") -> str:
                 if not isinstance(e, yt_dlp.utils.DownloadError):
                     raise
                 msg = str(e).lower()
-                if is_youtube(url) and any(x in msg for x in ("player response", "sign in to confirm", "requested format", "unable to extract", "http error 403", "forbidden")):
+                if is_youtube(url):
+                    if any(x in msg for x in YT_FINAL):
+                        raise  # private / removed / copyright: no other client can help
                     continue
                 if mode == "audio" or "requested format" not in msg:
                     raise
@@ -440,6 +459,7 @@ def fetch(url: str, folder: str, mode: str = "video") -> str:
             path = pick_file(folder, mode)
             if path:
                 return path
+            capped = True
         if insta:
             clear_folder(folder)
             try:
@@ -481,6 +501,7 @@ async def download(req: Req, request: Request):
             path = await asyncio.to_thread(fetch, req.url.strip(), folder, req.mode)
     except Exception as e:
         shutil.rmtree(folder, ignore_errors=True)
+        print(f"[toolora] download failed ({req.mode}) {req.url.strip()[:120]}: {ANSI.sub('', str(e))[:600]}", flush=True)
         reason = clean_error(e)
         what = "extract the audio from" if req.mode == "audio" else "download"
         raise HTTPException(422, f"Couldn't {what} that video: {reason}")
