@@ -21,10 +21,15 @@ WORKDIR /app
 
 COPY requirements.txt .
 
-# yt-dlp[default,curl-cffi] includes the matching yt-dlp-ejs package needed by current
-# YouTube extraction. Install the latest stable package instead of a prerelease
-# so Render builds remain reproducible against a released dependency.
-RUN pip install --no-cache-dir -U "yt-dlp[default,curl-cffi]" fastapi "uvicorn[standard]"
+# yt-dlp[default] includes the matching yt-dlp-ejs package needed by current
+# YouTube extraction. The curl-cffi extra is REQUIRED for Instagram (and helps
+# TikTok): current yt-dlp reads Instagram by impersonating a real browser, which
+# only works when curl-cffi is installed. The second command upgrades only the
+# yt-dlp package itself to its newest nightly build (no pre-release dependencies),
+# because Instagram/TikTok/YouTube fixes land there first.
+RUN pip install --no-cache-dir -U "yt-dlp[default,curl-cffi]" fastapi "uvicorn[standard]" \
+    && pip install --no-cache-dir -U --pre --no-deps yt-dlp \
+    && python -c "import yt_dlp, curl_cffi; print('yt-dlp', yt_dlp.version.__version__, '| curl_cffi', curl_cffi.__version__)"
 
 COPY main.py .
 

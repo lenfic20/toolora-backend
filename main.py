@@ -9,18 +9,19 @@ Env vars (all optional):
   MAX_CONCURRENT    simultaneous downloads (default 3)
   RATE_PER_MINUTE   requests per IP per minute (default 10)
   PROXY_SECRET      shared secret sent by the Toolora worker; when set, /download only accepts requests that carry it
+  COOKIES_TXT       (optional) browser cookies in Netscape cookies.txt format. Lets Instagram/YouTube serve the server
+                    like a logged-in browser, which fixes "login required" / "sign in to confirm" blocks.
+                    Alternatives: COOKIES_B64 (the same file, base64-encoded) or a Render Secret File named cookies.txt
+  YTDLP_PROXY       (optional) proxy URL such as http://user:pass@host:port, used for every outgoing request
 """
-import asyncio, hmac, os, re, shutil, tempfile, time, subprocess, html as html_lib, json
+import asyncio, base64, hmac, html, os, re, shutil, subprocess, tempfile, time
+import urllib.error, urllib.request
 from typing import Literal
 from collections import defaultdict, deque
-from urllib.parse import urlparse, urljoin
-
-try:
-    from curl_cffi import requests as curl_requests
-except Exception:
-    curl_requests = None
+from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
 import yt_dlp
+import yt_dlp.cookies
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -29,13 +30,14 @@ from pydantic import BaseModel
 from starlette.background import BackgroundTask
 
 ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
-MAX_MB = int(os.getenv("MAX_FILESIZE_MB", "1024"))
-RATE = int(os.getenv("RATE_PER_MINUTE", "60"))
+MAX_MB = int(os.getenv("MAX_FILESIZE_MB", "200"))
+RATE = int(os.getenv("RATE_PER_MINUTE", "10"))
 PROXY_SECRET = os.getenv("PROXY_SECRET", "")
+OUT_PROXY = os.getenv("YTDLP_PROXY", "").strip()
 slots = asyncio.Semaphore(int(os.getenv("MAX_CONCURRENT", "3")))
 
 # Only these sites (and their subdomains) are accepted; this also blocks SSRF to internal hosts.
-ALLOWED_HOSTS = ("youtube.com", "youtu.be", "youtube-nocookie.com", "tiktok.com", "instagram.com", "instagr.am", "facebook.com", "fb.watch", "twitter.com", "x.com", "reddit.com", "redd.it", "vimeo.com", "dailymotion.com")
+ALLOWED_HOSTS = ("youtube.com", "youtu.be", "tiktok.com", "instagram.com", "instagr.am", "twitter.com", "x.com")
 
 app = FastAPI(title="Toolora backend")
 app.add_middleware(
@@ -80,8 +82,8 @@ def valid_url(u: str) -> bool:
     return p.scheme in ("http", "https") and any(host == h or host.endswith("." + h) for h in ALLOWED_HOSTS)
 
 
-SORT = ["res", "ext:mp4:m4a"]
-FRAGMENT = re.compile(r"\.f[\w-]+\.[A-Za-z0-9]+$")
+SORT = ["res", "ext:mp4:m4a"]  # best resolution, preferring MP4/M4A so the result plays on phones
+FRAGMENT = re.compile(r"\.f[\w-]+\.[A-Za-z0-9]+$")  # intermediate streams such as "name.f137.mp4"
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 
@@ -97,326 +99,360 @@ def clear_folder(folder: str) -> None:
                 pass
 
 
-def platform_for(url: str) -> str:
-    host = (urlparse(url).hostname or "").lower()
-    if host == "youtube.com" or host.endswith(".youtube.com") or host == "youtu.be" or host.endswith(".youtu.be"):
-        return "youtube"
-    if host == "instagram.com" or host.endswith(".instagram.com") or host == "instagr.am" or host.endswith(".instagr.am"):
-        return "instagram"
-    if host == "tiktok.com" or host.endswith(".tiktok.com"):
-        return "tiktok"
-    if host == "twitter.com" or host.endswith(".twitter.com") or host == "x.com" or host.endswith(".x.com"):
-        return "x"
-    return "other"
-
-
 def is_youtube(url: str) -> bool:
-    return platform_for(url) == "youtube"
+    host = (urlparse(url).hostname or "").lower()
+    return host == "youtube.com" or host.endswith(".youtube.com") or host == "youtu.be" or host.endswith(".youtu.be")
 
 
-def needs_impersonation(url: str) -> bool:
-    return platform_for(url) in {"instagram", "tiktok", "x"}
+IMAGE_EXT = (".jpg", ".jpeg", ".png", ".webp")
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+IG_CDN = ("cdninstagram.com", "fbcdn.net")  # the only hosts the fallback downloader will pull media from
 
 
-def _youtube_attempts(mode: str) -> list[dict]:
-    if mode == "audio":
-        formats = [
-            {"format": "bestaudio[ext=m4a]/bestaudio/best"},
-            {"format": "bestaudio/best"},
-        ]
-    else:
-        # Prefer MP4/H264 where available, then fall back through lower resolutions.
-        formats = [
-            {"format": "bv*[ext=mp4][height<=1080]+ba[ext=m4a]/bv*[height<=1080]+ba/b[height<=1080]", "format_sort": SORT},
-            {"format": "bv*[ext=mp4][height<=720]+ba[ext=m4a]/bv*[height<=720]+ba/b[height<=720]", "format_sort": SORT},
-            {"format": "bv*[ext=mp4][height<=480]+ba[ext=m4a]/bv*[height<=480]+ba/b[height<=480]", "format_sort": SORT},
-            {"format": "best[ext=mp4]/best"},
-        ]
+def is_instagram(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return host in ("instagram.com", "instagr.am") or host.endswith(".instagram.com") or host.endswith(".instagr.am")
 
-    # YouTube is currently changing which Innertube clients can download GVS
-    # formats. Try clients that commonly work without account cookies before the
-    # generic extractor. A PO token can be supplied through the environment when
-    # YouTube requires one for the Render server's IP.
-    clients = ["tv_simply", "web_embedded", "tv", "android_vr", "web_safari", "ios", "android", "web"]
-    out = []
-    po = os.getenv("YOUTUBE_PO_TOKEN", "").strip()
-    po_client = os.getenv("YOUTUBE_PO_CLIENT", "mweb").strip() or "mweb"
-    for client in clients:
-        for item in formats:
-            x = dict(item)
-            args = {"player_client": [client]}
-            if po and client == po_client:
-                args["po_token"] = [f"{po_client}.gvs+{po}"]
-            x["extractor_args"] = {"youtube": args}
-            x["remote_components"] = {"ejs:github", "ejs:npm"}
+
+def load_cookies() -> str:
+    """Optional browser cookies (Netscape format) from env vars or a secret file. Empty string when not configured."""
+    raw = os.getenv("COOKIES_TXT", "")
+    if not raw.strip() and os.getenv("COOKIES_B64", "").strip():
+        try:
+            raw = base64.b64decode(os.environ["COOKIES_B64"]).decode("utf-8", "replace")
+        except Exception:
+            raw = ""
+    if not raw.strip():
+        here = os.path.dirname(os.path.abspath(__file__))
+        for path in (os.getenv("COOKIES_FILE", ""), "/etc/secrets/cookies.txt", os.path.join(here, "cookies.txt")):
+            if path and os.path.isfile(path):
+                try:
+                    with open(path, encoding="utf-8", errors="replace") as fh:
+                        raw = fh.read()
+                    break
+                except OSError:
+                    pass
+    raw = raw.strip()
+    if not raw:
+        return ""
+    if "\n" not in raw and "\\n" in raw:  # some dashboards store a multi-line value with literal \n
+        raw = raw.replace("\\n", "\n")
+    # Keep only well-formed cookie lines; one malformed line would otherwise make every download fail.
+    lines = ["# Netscape HTTP Cookie File"]
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or (line.startswith("#") and not line.startswith("#HttpOnly_")):
+            continue
+        parts = line.split("\t") if "\t" in line else line.split(None, 6)
+        if len(parts) != 7:
+            continue
+        domain = parts[0].replace("#HttpOnly_", "")
+        parts[1] = "TRUE" if domain.startswith(".") else "FALSE"  # the "include subdomains" flag must match the leading dot
+        parts[3] = "TRUE" if parts[3].strip().upper() == "TRUE" else "FALSE"
+        if not parts[4].strip().lstrip("-").isdigit():
+            parts[4] = "0"
+        lines.append("\t".join(parts))
+    return "\n".join(lines) + "\n" if len(lines) > 1 else ""
+
+
+COOKIES = load_cookies()
+
+
+def open_url(req, timeout=25):
+    handlers = [urllib.request.ProxyHandler({"http": OUT_PROXY, "https": OUT_PROXY})] if OUT_PROXY else []
+    return urllib.request.build_opener(*handlers).open(req, timeout=timeout)
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        return None
+
+
+def normalize_url(url: str) -> str:
+    """Make links friendlier for the extractors: instagr.am -> instagram.com, resolve /share/ links, drop tracking params."""
+    url = url.strip()
+    if not is_instagram(url):
+        return url
+    p = urlparse(url)
+    host = (p.hostname or "").lower()
+    if host == "instagr.am" or host.endswith(".instagr.am"):
+        host = "www.instagram.com"
+    path = p.path or "/"
+    cur = f"https://{host}{path}"
+    for _ in range(4):  # share links such as /share/reel/XXXX redirect to the real /reel/<code>/ page
+        if not urlparse(cur).path.startswith("/share/"):
+            break
+        try:
+            handlers = [_NoRedirect]
+            if OUT_PROXY:
+                handlers.append(urllib.request.ProxyHandler({"http": OUT_PROXY, "https": OUT_PROXY}))
+            urllib.request.build_opener(*handlers).open(
+                urllib.request.Request(cur, headers={"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"}), timeout=15).close()
+            break  # no redirect: nothing more to resolve
+        except urllib.error.HTTPError as e:
+            loc = e.headers.get("Location") if e.headers else None
+            if e.code not in (301, 302, 303, 307, 308) or not loc:
+                break
+            nxt = urljoin(cur, loc)
+            q = parse_qs(urlparse(nxt).query)
+            if "/accounts/login" in urlparse(nxt).path and q.get("next"):  # login wall that remembers the target
+                nxt = urljoin(cur, unquote(q["next"][0]))
+            if not is_instagram(nxt):
+                break
+            np = urlparse(nxt)
+            cur = f"https://{(np.hostname or host).lower()}{np.path or '/'}"
+        except Exception:
+            break
+    return cur
+
+
+def clean_error(e: BaseException) -> str:
+    """A readable one-line reason; never empty."""
+    msg = ANSI.sub("", str(e)).strip()
+    msg = re.sub(r"^(ERROR:\s*)+", "", msg)
+    msg = re.sub(r"\s+", " ", msg).strip()
+    if not msg:
+        cause = getattr(e, "exc_info", None)
+        cause = cause[1] if cause else e.__cause__
+        msg = re.sub(r"\s+", " ", str(cause or "")).strip()
+    if not msg:
+        msg = ("the site didn't return a playable file. The post may be private, deleted or restricted, "
+               "or the site is temporarily blocking the server. Please try again in a moment.")
+    return msg[:360]
+
+
+def _unesc(s: str) -> str:
+    s = html.unescape(s)
+    s = re.sub(r"\\+/", "/", s)
+    s = re.sub(r"\\+u0026", "&", s)
+    s = re.sub(r"\\+u0025", "%", s)
+    return s
+
+
+def _uniq(xs):
+    seen, out = set(), []
+    for x in xs:
+        if x not in seen:
+            seen.add(x)
             out.append(x)
-    out.extend({**x, "remote_components": {"ejs:github", "ejs:npm"}} for x in formats)
     return out
+
+
+def ig_media_urls(page: str):
+    """Pull direct video / picture URLs out of an Instagram embed or post page."""
+    t = _unesc(page)
+    vids = re.findall(r'video_url\\*"\s*:\s*\\*"(https?://[^"\\\s]+)', t)
+    vids += re.findall(r'<meta[^>]+property=["\']og:video(?::secure_url|:url)?["\'][^>]+content=["\'](https?://[^"\']+)', t)
+    vids += re.findall(r'<video[^>]+src=["\'](https?://[^"\']+)', t)
+    imgs = re.findall(r'display_url\\*"\s*:\s*\\*"(https?://[^"\\\s]+)', t)
+    imgs += re.findall(r'class=["\'][^"\']*EmbeddedMediaImage[^"\']*["\'][^>]+src=["\'](https?://[^"\']+)', t)
+    imgs += re.findall(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\'](https?://[^"\']+)', t)
+    return _uniq(vids), _uniq(imgs)
+
+
+def cdn_ok(u: str) -> bool:
+    p = urlparse(u)
+    host = (p.hostname or "").lower()
+    return p.scheme == "https" and any(host == h or host.endswith("." + h) for h in IG_CDN)
+
+
+def page_text(url: str) -> str:
+    """Fetch a page like a browser. Uses curl_cffi (Chrome impersonation) when present, plain urllib otherwise."""
+    try:
+        from curl_cffi import requests as cr
+        kw = {"proxies": {"http": OUT_PROXY, "https": OUT_PROXY}} if OUT_PROXY else {}
+        r = cr.get(url, headers={"Accept-Language": "en-US,en;q=0.9"}, impersonate="chrome", timeout=25, allow_redirects=True, **kw)
+        if r.status_code == 200 and r.text:
+            return r.text
+    except Exception:
+        pass
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9",
+                                                   "Accept": "text/html,application/xhtml+xml,*/*;q=0.8"})
+        with open_url(req) as r:
+            return r.read(6_000_000).decode("utf-8", "replace")
+    except Exception:
+        return ""
+
+
+def download_to(u: str, path: str) -> None:
+    limit = MAX_MB * 1024 * 1024
+    got = 0
+    req = urllib.request.Request(u, headers={"User-Agent": UA, "Referer": "https://www.instagram.com/"})
+    with open_url(req, 45) as r, open(path, "wb") as fh:
+        while True:
+            chunk = r.read(1 << 16)
+            if not chunk:
+                break
+            got += len(chunk)
+            if got > limit:
+                raise RuntimeError(f"the file is larger than the {MAX_MB} MB limit")
+            fh.write(chunk)
+    if got == 0:
+        raise RuntimeError("the download was empty")
+
+
+def to_mp3(src: str, folder: str, stem: str) -> str:
+    out = os.path.join(folder, stem + ".mp3")
+    r = subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", src, "-vn", "-codec:a", "libmp3lame", "-b:a", "192k", out],
+                       capture_output=True, timeout=180)
+    if r.returncode != 0 or not os.path.isfile(out) or os.path.getsize(out) == 0:
+        raise RuntimeError("this post has no audio track")
+    os.remove(src)
+    return out
+
+
+def instagram_fallback(url: str, folder: str, mode: str) -> str:
+    """Last resort when yt-dlp can't read an Instagram post: read the public embed page and download the media directly."""
+    m = re.search(r"instagram\.com/(?:[^/?#]+/)?(?:p|reels?|tv)/([A-Za-z0-9_-]+)", url)
+    if not m:
+        raise RuntimeError("not a post, reel or video link")
+    code = m.group(1)
+    vids, imgs = [], []
+    for page in (f"https://www.instagram.com/p/{code}/embed/captioned/",
+                 f"https://www.instagram.com/reel/{code}/embed/captioned/",
+                 f"https://www.instagram.com/p/{code}/"):
+        text = page_text(page)
+        if not text:
+            continue
+        v, i = ig_media_urls(text)
+        vids += [x for x in v if cdn_ok(x)]
+        imgs += [x for x in i if cdn_ok(x)]
+        if vids:
+            break
+    stem = f"instagram_{code}"
+    last = None
+    for u in _uniq(vids):
+        path = os.path.join(folder, stem + ".mp4")
+        try:
+            download_to(u, path)
+            return to_mp3(path, folder, stem) if mode == "audio" else path
+        except Exception as e:
+            last = e
+    if mode == "audio":
+        raise last or RuntimeError("this post has no audio track")
+    for u in _uniq(imgs):
+        ext = os.path.splitext(urlparse(u).path)[1].lower()
+        path = os.path.join(folder, stem + (ext if ext in IMAGE_EXT else ".jpg"))
+        try:
+            download_to(u, path)
+            return path
+        except Exception as e:
+            last = e
+    raise last or RuntimeError("Instagram did not return any media for this link")
 
 
 def attempts_for(mode: str, url: str) -> list[dict]:
-    platform = platform_for(url)
-    if platform == "youtube":
-        return _youtube_attempts(mode)
-
     if mode == "audio":
-        formats = [
-            {"format": "bestaudio[ext=m4a]/bestaudio/best", "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}]},
-            {"format": "best[ext=mp4]/best", "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}]},
-        ]
+        formats = [{
+            "format": "bestaudio/best",
+            "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}],
+        }]
     else:
-        formats = [
-            {"format": "bv*[ext=mp4][height<=1080]+ba[ext=m4a]/bv*[height<=1080]+ba/b[height<=1080]", "format_sort": SORT},
-            {"format": "bv*[height<=720]+ba/b[height<=720]", "format_sort": SORT},
-            {"format": "bv*[height<=480]+ba/b[height<=480]", "format_sort": SORT},
-            {"format": "best[ext=mp4]/best"},
-        ]
+        formats = [{"format": "bv*+ba/b", "format_sort": SORT},
+                   {"format": "bv*[height<=1080]+ba/b[height<=1080]", "format_sort": SORT},
+                   {"format": "bv*[height<=720]+ba/b[height<=720]", "format_sort": SORT},
+                   {"format": "bv*[height<=480]+ba/b[height<=480]", "format_sort": SORT},
+                   {"format": "best"}]
+    if is_instagram(url):
+        # Default web API first, then the iOS-app API, then plain "best" as a last format.
+        out = [formats[0], {**formats[0], "extractor_args": {"instagram": {"app_id": ["ios"]}}}]
+        if mode == "video":
+            out.append(formats[-1])
+        return out
+    if not is_youtube(url):
+        return formats
 
+    # YouTube's extractor changes frequently. Try current clients in a deliberate order.
+    clients = ["tv", "android_vr", "web_embedded", "web_safari", "web"]
     out = []
-    for item in formats:
-        x = dict(item)
-        # Try the extractor's normal request first and then with browser
-        # impersonation. This is particularly useful for Instagram/TikTok/X.
-        out.append(x)
-        y = dict(item)
-        y["http_headers"] = {
-            "User-Agent": "Mozilla/5.0 (Linux; Android 16; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Mobile Safari/537.36",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer": "https://www.instagram.com/" if platform == "instagram" else "https://www.tiktok.com/" if platform == "tiktok" else "https://x.com/",
-        }
-        y["impersonate"] = "chrome"
-        out.append(y)
+    for client in clients:
+        for item in formats[:4 if mode == "video" else 1]:
+            x = dict(item)
+            x["extractor_args"] = {"youtube": {"player_client": [client]}}
+            x["remote_components"] = ["ejs:github"]
+            out.append(x)
+    # Final generic attempts let yt-dlp choose a newly supported client.
+    out.extend({**x, "remote_components": ["ejs:github"]} for x in formats)
     return out
 
 
-
-
-def _download_direct(url: str, folder: str, mode: str, referer: str) -> str | None:
-    """Last-resort public-page media resolver.
-
-    Social sites frequently change the order/shape of their HTML metadata. Do not
-    depend on one exact attribute order or one JSON field. Collect every plausible
-    public media URL, normalize it, then try each candidate with browser-like headers.
-    This never bypasses login, CAPTCHA, DRM, or private content.
-    """
-    if curl_requests is None:
-        return None
-    ua = "Mozilla/5.0 (Linux; Android 16; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Mobile Safari/537.36"
-    headers = {"User-Agent": ua, "Accept-Language": "en-US,en;q=0.9", "Referer": referer,
-               "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"}
-    try:
-        r = curl_requests.get(url, headers=headers, impersonate="chrome", timeout=35, allow_redirects=True)
-        if r.status_code >= 400:
-            return None
-        text = r.text or ""
-        candidates: list[str] = []
-
-        # Parse all <meta ...> tags irrespective of attribute ordering.
-        for tag in re.findall(r"<meta\b[^>]*>", text, re.I):
-            attrs = {k.lower(): v for k, v in re.findall(r"([:\w-]+)\s*=\s*[\"']([^\"']*)[\"']", tag, re.I)}
-            key = (attrs.get("property") or attrs.get("name") or "").lower()
-            if key in {"og:video", "og:video:url", "og:video:secure_url", "og:image", "og:image:url",
-                       "twitter:image", "twitter:player:stream"}:
-                if attrs.get("content"):
-                    candidates.append(attrs["content"])
-
-        # JSON-LD and common social-media JSON fields.
-        patterns = [
-            r'"contentUrl"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"',
-            r'"video_url"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"',
-            r'"videoUrl"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"',
-            r'"playAddr"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"',
-            r'"downloadAddr"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"',
-            r'"play_addr"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"',
-            r'"display_url"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"',
-            r'"displayUrl"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"',
-            r'"src"\s*:\s*"(https?:\\/\\/[^"\\]+)"',
-            r'"url"\s*:\s*"(https?:\\/\\/[^"\\]+\.(?:mp4|m4v|webm|mov)(?:\\?[^"\\]*)?)"',
-            r'"url"\s*:\s*"(https?:\\/\\/[^"\\]+\.(?:jpg|jpeg|png|webp|gif)(?:\\?[^"\\]*)?)"',
-        ]
-        for pat in patterns:
-            candidates.extend(re.findall(pat, text, re.I))
-
-        # Openly embedded CDN media URLs.
-        candidates.extend(re.findall(r"https?:\\?/\\?/[^\"'<>\\s]+?(?:\\.mp4|\\.m4v|\\.webm|\\.mov|\\.jpg|\\.jpeg|\\.png|\\.webp|\\.gif)(?:\\?[^\"'<>\\s]*)?", text, re.I))
-
-        clean: list[str] = []
-        for c in candidates:
-            c = html_lib.unescape(c)
-            for _ in range(3):
-                c = c.replace('\\/', '/').replace('\\u0026', '&').replace('\\u003D', '=').replace('\\u002F', '/').replace('\\u003F', '?').replace('\\u003A', ':')
-            c = urljoin(str(r.url), c)
-            if c.startswith(('https://', 'http://')) and c not in clean:
-                clean.append(c)
-
-        if mode == "audio":
-            audio = [c for c in clean if any(x in c.lower().split('?')[0] for x in ('.mp3','.m4a','.aac','.ogg','.opus')) or 'audio' in c.lower()]
-            clean = audio + [c for c in clean if c not in audio]
-
-        for media_url in clean:
-            try:
-                mh = {"Referer": str(r.url), "User-Agent": ua, "Accept": "*/*"}
-                # HEAD is unreliable on many CDNs; probe with a tiny GET instead.
-                probe = curl_requests.get(media_url, headers={**mh, "Range": "bytes=0-0"}, impersonate="chrome", timeout=20, allow_redirects=True, stream=True)
-                if probe.status_code >= 400:
-                    probe.close()
-                    continue
-                ct = (probe.headers.get("content-type") or "").lower()
-                probe.close()
-                path_no_q = media_url.lower().split('?')[0]
-                if "image/" in ct or path_no_q.endswith(('.jpg','.jpeg','.png','.webp','.gif')):
-                    ext = ".jpg" if "jpeg" in ct else ".png" if "png" in ct else ".webp" if "webp" in ct else ".gif" if "gif" in ct else ".jpg"
-                elif "audio/" in ct or path_no_q.endswith(('.mp3','.m4a','.aac','.ogg','.opus')):
-                    ext = ".mp3" if mode == "audio" else (".m4a" if path_no_q.endswith('.m4a') else ".mp3")
-                else:
-                    ext = ".mp4" if path_no_q.endswith(('.mp4','.m4v')) or 'video/' in ct else ".webm" if path_no_q.endswith('.webm') else ".bin"
-                out = os.path.join(folder, f"social-fallback{ext}")
-                with curl_requests.get(media_url, headers=mh, impersonate="chrome", timeout=120, stream=True, allow_redirects=True) as dl:
-                    if dl.status_code >= 400:
-                        continue
-                    total = 0
-                    with open(out, "wb") as f:
-                        for chunk in dl.iter_content(1024 * 256):
-                            if not chunk:
-                                continue
-                            total += len(chunk)
-                            if total > MAX_MB * 1024 * 1024:
-                                raise RuntimeError("media exceeds the configured download limit")
-                            f.write(chunk)
-                if total <= 0:
-                    try: os.remove(out)
-                    except OSError: pass
-                    continue
-                if mode == "audio" and not out.endswith('.mp3'):
-                    mp3 = os.path.join(folder, "social-fallback.mp3")
-                    subprocess.run(["ffmpeg","-y","-i",out,"-vn","-codec:a","libmp3lame","-b:a","192k",mp3], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=240)
-                    if os.path.exists(mp3) and os.path.getsize(mp3) > 0:
-                        return mp3
-                return out
-            except Exception:
-                continue
-    except Exception:
-        return None
-    return None
-
 def pick_file(folder: str, mode: str) -> str | None:
-    want = (".mp3",) if mode == "audio" else (".mp4", ".mkv", ".webm", ".mov", ".jpg", ".jpeg", ".png", ".webp", ".gif")
+    want = (".mp3",) if mode == "audio" else (".mp4", ".mkv", ".webm", ".mov")
     files = [f for f in os.listdir(folder) if f.lower().endswith(want) and not FRAGMENT.search(f)]
+    if not files and mode == "video":  # photo posts: hand back the picture
+        files = [f for f in os.listdir(folder) if f.lower().endswith(IMAGE_EXT) and not FRAGMENT.search(f)]
     if not files:
         return None
     return os.path.join(folder, max(files, key=lambda f: os.path.getsize(os.path.join(folder, f))))
 
 
 def fetch(url: str, folder: str, mode: str = "video") -> str:
-    platform = platform_for(url)
+    url = normalize_url(url)
     base = {
         "outtmpl": os.path.join(folder, "%(title).80B [%(id)s].%(ext)s"),
         "merge_output_format": "mp4",
         "noplaylist": True,
         "restrictfilenames": True,
         "max_filesize": MAX_MB * 1024 * 1024,
-        "socket_timeout": 30,
+        "socket_timeout": 20,
         "quiet": True,
         "no_warnings": False,
-        "retries": 12,
-        "fragment_retries": 12,
-        "extractor_retries": 6,
-        "file_access_retries": 8,
-        "continuedl": True,
-        "noprogress": True,
-        "retry_sleep_functions": {"http": lambda n: min(8, 1.5 * (n + 1))},
-        "concurrent_fragment_downloads": 1,
-        "remote_components": {"ejs:github", "ejs:npm"},
-        "js_runtimes": {"deno": {}},
-        "geo_bypass": True,
-        "http_headers": {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36",
-            "Accept-Language": "en-US,en;q=0.9",
-        },
+        "retries": 3,
+        "fragment_retries": 3,
+        "remote_components": ["ejs:github"],
     }
-    last = None
-    errors: list[str] = []
-    for attempt_no, extra in enumerate(attempts_for(mode, url), 1):
-        clear_folder(folder)
-        opts = {**base, **extra}
-        if needs_impersonation(url):
-            opts.setdefault("impersonate", "chrome")
+    if OUT_PROXY:
+        base["proxy"] = OUT_PROXY
+    cookie_path = None
+    if COOKIES:
+        fd, cookie_path = tempfile.mkstemp(prefix="ck_", suffix=".txt")  # yt-dlp rewrites its cookie file, so give it a private copy
+        with os.fdopen(fd, "w") as fh:
+            fh.write(COOKIES)
         try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                ydl.download([url])
-        except yt_dlp.utils.DownloadError as e:
-            last = e
-            clean = ANSI.sub("", str(e)).strip()
-            if clean:
-                errors.append(clean[:320])
-            msg = clean.lower()
-            # Keep trying when a platform temporarily rejects one request style.
-            if any(x in msg for x in ("http error 429", "too many requests", "rate-limit", "http error 403", "forbidden", "unable to download", "unable to extract", "requested format", "sign in to confirm", "challenge", "captcha")):
-                time.sleep(min(3, 0.5 + attempt_no * 0.25))
-                continue
-            # yt-dlp's extractors can fail for a single format while another
-            # format is still usable, so continue through the complete strategy list.
-            continue
-        path = pick_file(folder, mode)
-        if path:
-            if mode == "video":
-                ext = os.path.splitext(path)[1].lower()
-                if ext in (".webm", ".mkv", ".mov"):
-                    mp4 = os.path.join(folder, os.path.splitext(os.path.basename(path))[0] + ".mp4")
-                    try:
-                        subprocess.run(
-                            ["ffmpeg", "-y", "-i", path, "-map", "0:v:0", "-map", "0:a?", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", mp4],
-                            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180,
-                        )
-                        if os.path.exists(mp4) and os.path.getsize(mp4) > 0:
-                            return mp4
-                    except (subprocess.SubprocessError, OSError):
-                        pass
-            return path
-    # Final public-page fallback. This catches cases where a platform changes its
-    # extractor but still exposes a direct media URL in the page metadata.
-    referers = [
-        "https://www.instagram.com/" if platform == "instagram" else
-        "https://www.tiktok.com/" if platform == "tiktok" else
-        "https://x.com/" if platform == "x" else
-        "https://www.youtube.com/",
-        "https://www.google.com/",
-        "https://www.facebook.com/",
-    ]
-    fallback = None
-    for ref in referers:
-        fallback = _download_direct(url, folder, mode, ref)
-        if fallback:
-            break
-    if fallback:
-        if mode == "video":
-            ext = os.path.splitext(fallback)[1].lower()
-            if ext in (".webm", ".mkv", ".mov"):
-                mp4 = os.path.join(folder, "social-fallback.mp4")
-                try:
-                    subprocess.run(["ffmpeg","-y","-i",fallback,"-map","0:v:0","-map","0:a?","-c:v","libx264","-preset","veryfast","-crf","23","-c:a","aac","-b:a","128k","-movflags","+faststart",mp4], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180)
-                    if os.path.exists(mp4) and os.path.getsize(mp4) > 0:
-                        return mp4
-                except Exception:
-                    pass
-        return fallback
-
-    # For audio, do not require the platform to expose a separate audio stream.
-    # Download a video-capable representation and extract its soundtrack locally.
-    if mode == "audio":
-        try:
-            clear_folder(folder)
-            video_path = fetch(url, folder, "video")
-            mp3 = os.path.join(folder, "toolora-audio.mp3")
-            subprocess.run(["ffmpeg","-y","-i",video_path,"-vn","-codec:a","libmp3lame","-b:a","192k",mp3], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180)
-            if os.path.exists(mp3) and os.path.getsize(mp3) > 0:
-                return mp3
-        except Exception:
+            yt_dlp.cookies.YoutubeDLCookieJar(cookie_path).load(ignore_discard=True, ignore_expires=True)
+            base["cookiefile"] = cookie_path
+        except Exception:  # unusable cookies must never block downloads
             pass
-
-    detail = errors[-1] if errors else "No public media stream was available."
-    # Do not expose a huge yt-dlp traceback to the visitor.
-    raise RuntimeError(detail[:500])
+    insta = is_instagram(url)
+    last = None
+    try:
+        for extra in attempts_for(mode, url):
+            clear_folder(folder)
+            try:
+                with yt_dlp.YoutubeDL({**base, **extra}) as ydl:
+                    ydl.download([url])
+            except Exception as e:
+                last = e
+                if insta:  # Instagram is flaky from servers: always try the next strategy
+                    continue
+                if not isinstance(e, yt_dlp.utils.DownloadError):
+                    raise
+                msg = str(e).lower()
+                if is_youtube(url) and any(x in msg for x in ("player response", "sign in to confirm", "requested format", "unable to extract", "http error 403", "forbidden")):
+                    continue
+                if mode == "audio" or "requested format" not in msg:
+                    raise
+                continue
+            path = pick_file(folder, mode)
+            if path:
+                return path
+        if insta:
+            clear_folder(folder)
+            try:
+                return instagram_fallback(url, folder, mode)
+            except Exception as e:
+                if last is None:
+                    last = e
+        if last:
+            raise last
+        raise RuntimeError("no file produced (it may exceed the size limit)")
+    finally:
+        if cookie_path:
+            try:
+                os.remove(cookie_path)
+            except OSError:
+                pass
 
 
 @app.get("/health")
@@ -442,11 +478,11 @@ async def download(req: Req, request: Request):
             path = await asyncio.to_thread(fetch, req.url.strip(), folder, req.mode)
     except Exception as e:
         shutil.rmtree(folder, ignore_errors=True)
-        reason = ANSI.sub("", str(e)).removeprefix("ERROR: ")[:260]
+        reason = clean_error(e)
         what = "extract the audio from" if req.mode == "audio" else "download"
         raise HTTPException(422, f"Couldn't {what} that video: {reason}")
     ext = os.path.splitext(path)[1].lower()
-    media = {".mp3": "audio/mpeg", ".mp4": "video/mp4", ".webm": "video/webm", ".mkv": "video/x-matroska", ".mov": "video/quicktime", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp", ".gif": "image/gif"}.get(ext, "application/octet-stream")
+    media = {".mp3": "audio/mpeg", ".mp4": "video/mp4", ".webm": "video/webm", ".mkv": "video/x-matroska", ".mov": "video/quicktime", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp"}.get(ext, "application/octet-stream")
     return FileResponse(path, media_type=media, filename=os.path.basename(path), background=cleanup)
 
 
