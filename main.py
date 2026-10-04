@@ -10,10 +10,15 @@ Env vars (all optional):
   RATE_PER_MINUTE   requests per IP per minute (default 10)
   PROXY_SECRET      shared secret sent by the Toolora worker; when set, /download only accepts requests that carry it
 """
-import asyncio, hmac, os, re, shutil, tempfile, time, subprocess
+import asyncio, hmac, os, re, shutil, tempfile, time, subprocess, html as html_lib, json
 from typing import Literal
 from collections import defaultdict, deque
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
+
+try:
+    from curl_cffi import requests as curl_requests
+except Exception:
+    curl_requests = None
 
 import yt_dlp
 from fastapi import FastAPI, HTTPException, Request
@@ -24,7 +29,7 @@ from pydantic import BaseModel
 from starlette.background import BackgroundTask
 
 ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
-MAX_MB = int(os.getenv("MAX_FILESIZE_MB", "200"))
+MAX_MB = int(os.getenv("MAX_FILESIZE_MB", "1024"))
 RATE = int(os.getenv("RATE_PER_MINUTE", "10"))
 PROXY_SECRET = os.getenv("PROXY_SECRET", "")
 slots = asyncio.Semaphore(int(os.getenv("MAX_CONCURRENT", "3")))
@@ -184,6 +189,103 @@ def attempts_for(mode: str, url: str) -> list[dict]:
     return out
 
 
+
+
+def _download_direct(url: str, folder: str, mode: str, referer: str) -> str | None:
+    """Last-resort extractor for public pages that expose a direct media URL in HTML.
+    This is deliberately limited to the allowed social hosts and never follows arbitrary
+    redirects to internal/private addresses.
+    """
+    if curl_requests is None:
+        return None
+    try:
+        r = curl_requests.get(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Linux; Android 16; K) AppleWebKit/537.36 Chrome/140.0 Mobile Safari/537.36",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Referer": referer,
+            },
+            impersonate="chrome",
+            timeout=25,
+            allow_redirects=True,
+        )
+        if r.status_code >= 400:
+            return None
+        text = r.text
+        candidates = []
+        # Standard OpenGraph/Twitter metadata.
+        for pat in (
+            r'<meta[^>]+property=["\'](?:og:video(?::secure_url)?|og:video:url)["\'][^>]+content=["\']([^"\']+)',
+            r'<meta[^>]+name=["\']twitter:player:stream["\'][^>]+content=["\']([^"\']+)',
+            r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)',
+        ):
+            candidates += re.findall(pat, text, re.I)
+        # Common JSON-embedded media fields used by TikTok/Instagram/X pages.
+        for pat in (
+            r'"playAddr"\s*:\s*"([^"]+)"',
+            r'"downloadAddr"\s*:\s*"([^"]+)"',
+            r'"video_url"\s*:\s*"([^"]+)"',
+            r'"video_versions"\s*:\s*\[\s*\{[^}]*?"url"\s*:\s*"([^"]+)"',
+            r'"contentUrl"\s*:\s*"([^"]+)"',
+        ):
+            candidates += re.findall(pat, text, re.I)
+        clean = []
+        for c in candidates:
+            c = html_lib.unescape(c).replace('\\/', '/').replace('\\u0026', '&').replace('\\u003D', '=').replace('\\u002F', '/')
+            try:
+                c = json.loads('"'+c.replace('"','\\"')+'"') if '\\u' in c else c
+            except Exception:
+                pass
+            c = urljoin(str(r.url), c)
+            if c.startswith(('https://', 'http://')) and c not in clean:
+                clean.append(c)
+        if mode == "audio":
+            # Prefer an explicit audio URL if the page exposes one; otherwise grab
+            # the public video and extract its soundtrack with ffmpeg below.
+            audio_candidates = [c for c in clean if any(x in c.lower() for x in ('.mp3', '.m4a', '.aac', '.ogg', '.opus', 'audio'))]
+            if audio_candidates:
+                clean = audio_candidates + clean
+        if not clean:
+            return None
+        for media_url in clean:
+            try:
+                head = curl_requests.head(media_url, headers={"Referer": referer, "User-Agent": "Mozilla/5.0"}, impersonate="chrome", timeout=15, allow_redirects=True)
+                if head.status_code >= 400:
+                    continue
+                ct = (head.headers.get("content-type") or "").lower()
+                ext = ".mp4" if "video" in ct or media_url.lower().split('?')[0].endswith(('.mp4','.m4v')) else ".jpg" if "image" in ct else ".bin"
+                if mode == "audio" and ("audio" in ct or media_url.lower().split('?')[0].endswith(('.mp3','.m4a','.aac','.ogg','.opus'))):
+                    ext = ".mp3" if not media_url.lower().split('?')[0].endswith('.mp3') else ".mp3"
+                out = os.path.join(folder, f"social-fallback{ext}")
+                with curl_requests.get(media_url, headers={"Referer": referer, "User-Agent": "Mozilla/5.0"}, impersonate="chrome", timeout=60, stream=True, allow_redirects=True) as dl:
+                    if dl.status_code >= 400:
+                        continue
+                    total = 0
+                    with open(out, "wb") as f:
+                        for chunk in dl.iter_content(1024 * 256):
+                            if not chunk:
+                                continue
+                            total += len(chunk)
+                            if total > MAX_MB * 1024 * 1024:
+                                raise RuntimeError("media exceeds the configured download limit")
+                            f.write(chunk)
+                if total <= 0:
+                    try: os.remove(out)
+                    except OSError: pass
+                    continue
+                if mode == "audio" and not out.endswith('.mp3'):
+                    mp3 = os.path.join(folder, "social-fallback.mp3")
+                    subprocess.run(["ffmpeg","-y","-i",out,"-vn","-codec:a","libmp3lame","-b:a","192k",mp3], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180)
+                    if os.path.exists(mp3) and os.path.getsize(mp3) > 0:
+                        return mp3
+                return out
+            except Exception:
+                continue
+    except Exception:
+        return None
+    return None
+
 def pick_file(folder: str, mode: str) -> str | None:
     want = (".mp3",) if mode == "audio" else (".mp4", ".mkv", ".webm", ".mov", ".jpg", ".jpeg", ".png", ".webp", ".gif")
     files = [f for f in os.listdir(folder) if f.lower().endswith(want) and not FRAGMENT.search(f)]
@@ -255,11 +357,42 @@ def fetch(url: str, folder: str, mode: str = "video") -> str:
                     except (subprocess.SubprocessError, OSError):
                         pass
             return path
-    if last:
-        detail = errors[-1] if errors else str(last)
-        # Do not expose a huge yt-dlp traceback to the visitor.
-        raise RuntimeError(detail[:500])
-    raise RuntimeError("No media file was produced. The link may be private, login-only, unavailable, or temporarily blocked by the platform.")
+    # Final public-page fallback. This catches cases where a platform changes its
+    # extractor but still exposes a direct media URL in the page metadata.
+    fallback = _download_direct(url, folder, mode,
+        "https://www.instagram.com/" if platform == "instagram" else
+        "https://www.tiktok.com/" if platform == "tiktok" else
+        "https://x.com/" if platform == "x" else
+        "https://www.youtube.com/")
+    if fallback:
+        if mode == "video":
+            ext = os.path.splitext(fallback)[1].lower()
+            if ext in (".webm", ".mkv", ".mov"):
+                mp4 = os.path.join(folder, "social-fallback.mp4")
+                try:
+                    subprocess.run(["ffmpeg","-y","-i",fallback,"-map","0:v:0","-map","0:a?","-c:v","libx264","-preset","veryfast","-crf","23","-c:a","aac","-b:a","128k","-movflags","+faststart",mp4], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180)
+                    if os.path.exists(mp4) and os.path.getsize(mp4) > 0:
+                        return mp4
+                except Exception:
+                    pass
+        return fallback
+
+    # For audio, do not require the platform to expose a separate audio stream.
+    # Download a video-capable representation and extract its soundtrack locally.
+    if mode == "audio":
+        try:
+            clear_folder(folder)
+            video_path = fetch(url, folder, "video")
+            mp3 = os.path.join(folder, "toolora-audio.mp3")
+            subprocess.run(["ffmpeg","-y","-i",video_path,"-vn","-codec:a","libmp3lame","-b:a","192k",mp3], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180)
+            if os.path.exists(mp3) and os.path.getsize(mp3) > 0:
+                return mp3
+        except Exception:
+            pass
+
+    detail = errors[-1] if errors else "No public media stream was available."
+    # Do not expose a huge yt-dlp traceback to the visitor.
+    raise RuntimeError(detail[:500])
 
 
 @app.get("/health")
