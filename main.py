@@ -75,8 +75,8 @@ def valid_url(u: str) -> bool:
     return p.scheme in ("http", "https") and any(host == h or host.endswith("." + h) for h in ALLOWED_HOSTS)
 
 
-SORT = ["res", "ext:mp4:m4a"]  # best resolution, preferring MP4/M4A so the result plays on phones
-FRAGMENT = re.compile(r"\.f[\w-]+\.[A-Za-z0-9]+$")  # intermediate streams such as "name.f137.mp4"
+SORT = ["res", "ext:mp4:m4a"]
+FRAGMENT = re.compile(r"\.f[\w-]+\.[A-Za-z0-9]+$")
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 
@@ -92,42 +92,95 @@ def clear_folder(folder: str) -> None:
                 pass
 
 
-def is_youtube(url: str) -> bool:
+def platform_for(url: str) -> str:
     host = (urlparse(url).hostname or "").lower()
-    return host == "youtube.com" or host.endswith(".youtube.com") or host == "youtu.be" or host.endswith(".youtu.be")
+    if host == "youtube.com" or host.endswith(".youtube.com") or host == "youtu.be" or host.endswith(".youtu.be"):
+        return "youtube"
+    if host == "instagram.com" or host.endswith(".instagram.com") or host == "instagr.am" or host.endswith(".instagr.am"):
+        return "instagram"
+    if host == "tiktok.com" or host.endswith(".tiktok.com"):
+        return "tiktok"
+    if host == "twitter.com" or host.endswith(".twitter.com") or host == "x.com" or host.endswith(".x.com"):
+        return "x"
+    return "other"
+
+
+def is_youtube(url: str) -> bool:
+    return platform_for(url) == "youtube"
 
 
 def needs_impersonation(url: str) -> bool:
-    host = (urlparse(url).hostname or "").lower()
-    return any(host == h or host.endswith("." + h) for h in ("instagram.com", "instagr.am", "tiktok.com", "twitter.com", "x.com"))
+    return platform_for(url) in {"instagram", "tiktok", "x"}
+
+
+def _youtube_attempts(mode: str) -> list[dict]:
+    if mode == "audio":
+        formats = [
+            {"format": "bestaudio[ext=m4a]/bestaudio/best"},
+            {"format": "bestaudio/best"},
+        ]
+    else:
+        # Prefer MP4/H264 where available, then fall back through lower resolutions.
+        formats = [
+            {"format": "bv*[ext=mp4][height<=1080]+ba[ext=m4a]/bv*[height<=1080]+ba/b[height<=1080]", "format_sort": SORT},
+            {"format": "bv*[ext=mp4][height<=720]+ba[ext=m4a]/bv*[height<=720]+ba/b[height<=720]", "format_sort": SORT},
+            {"format": "bv*[ext=mp4][height<=480]+ba[ext=m4a]/bv*[height<=480]+ba/b[height<=480]", "format_sort": SORT},
+            {"format": "best[ext=mp4]/best"},
+        ]
+
+    # YouTube is currently changing which Innertube clients can download GVS
+    # formats. Try clients that commonly work without account cookies before the
+    # generic extractor. A PO token can be supplied through the environment when
+    # YouTube requires one for the Render server's IP.
+    clients = ["tv_simply", "web_embedded", "tv", "android_vr", "web_safari", "ios", "android", "web"]
+    out = []
+    po = os.getenv("YOUTUBE_PO_TOKEN", "").strip()
+    po_client = os.getenv("YOUTUBE_PO_CLIENT", "mweb").strip() or "mweb"
+    for client in clients:
+        for item in formats:
+            x = dict(item)
+            args = {"player_client": [client]}
+            if po and client == po_client:
+                args["po_token"] = [f"{po_client}.gvs+{po}"]
+            x["extractor_args"] = {"youtube": args}
+            x["remote_components"] = {"ejs:github", "ejs:npm"}
+            out.append(x)
+    out.extend({**x, "remote_components": {"ejs:github", "ejs:npm"}} for x in formats)
+    return out
 
 
 def attempts_for(mode: str, url: str) -> list[dict]:
-    if mode == "audio":
-        formats = [{
-            "format": "bestaudio/best",
-            "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}],
-        }]
-    else:
-        formats = [{"format": "bv*+ba/b", "format_sort": SORT},
-                   {"format": "bv*[height<=1080]+ba/b[height<=1080]", "format_sort": SORT},
-                   {"format": "bv*[height<=720]+ba/b[height<=720]", "format_sort": SORT},
-                   {"format": "bv*[height<=480]+ba/b[height<=480]", "format_sort": SORT},
-                   {"format": "best"}]
-    if not is_youtube(url):
-        return formats
+    platform = platform_for(url)
+    if platform == "youtube":
+        return _youtube_attempts(mode)
 
-    # YouTube's extractor changes frequently. Try current clients in a deliberate order.
-    clients = ["mweb", "ios", "android", "android_vr", "tv", "web_embedded", "web_safari", "web", "tv_embedded"]
+    if mode == "audio":
+        formats = [
+            {"format": "bestaudio[ext=m4a]/bestaudio/best", "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}]},
+            {"format": "best[ext=mp4]/best", "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}]},
+        ]
+    else:
+        formats = [
+            {"format": "bv*[ext=mp4][height<=1080]+ba[ext=m4a]/bv*[height<=1080]+ba/b[height<=1080]", "format_sort": SORT},
+            {"format": "bv*[height<=720]+ba/b[height<=720]", "format_sort": SORT},
+            {"format": "bv*[height<=480]+ba/b[height<=480]", "format_sort": SORT},
+            {"format": "best[ext=mp4]/best"},
+        ]
+
     out = []
-    for client in clients:
-        for item in formats[:4 if mode == "video" else 1]:
-            x = dict(item)
-            x["extractor_args"] = {"youtube": {"player_client": [client]}}
-            x["remote_components"] = {"ejs:github", "ejs:npm"}
-            out.append(x)
-    # Final generic attempts let yt-dlp choose a newly supported client.
-    out.extend({**x, "remote_components": {"ejs:github", "ejs:npm"}} for x in formats)
+    for item in formats:
+        x = dict(item)
+        # Try the extractor's normal request first and then with browser
+        # impersonation. This is particularly useful for Instagram/TikTok/X.
+        out.append(x)
+        y = dict(item)
+        y["http_headers"] = {
+            "User-Agent": "Mozilla/5.0 (Linux; Android 16; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Mobile Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.instagram.com/" if platform == "instagram" else "https://www.tiktok.com/" if platform == "tiktok" else "https://x.com/",
+        }
+        y["impersonate"] = "chrome"
+        out.append(y)
     return out
 
 
@@ -140,47 +193,51 @@ def pick_file(folder: str, mode: str) -> str | None:
 
 
 def fetch(url: str, folder: str, mode: str = "video") -> str:
+    platform = platform_for(url)
     base = {
         "outtmpl": os.path.join(folder, "%(title).80B [%(id)s].%(ext)s"),
         "merge_output_format": "mp4",
         "noplaylist": True,
         "restrictfilenames": True,
         "max_filesize": MAX_MB * 1024 * 1024,
-        "socket_timeout": 20,
+        "socket_timeout": 30,
         "quiet": True,
         "no_warnings": False,
-        "retries": 3,
-        "fragment_retries": 3,
-        "sleep_interval_requests": 1,
+        "retries": 5,
+        "fragment_retries": 5,
+        "extractor_retries": 3,
+        "retry_sleep_functions": {"http": lambda n: min(8, 1.5 * (n + 1))},
+        "concurrent_fragment_downloads": 1,
         "remote_components": {"ejs:github", "ejs:npm"},
         "js_runtimes": {"deno": {}},
+        "geo_bypass": True,
         "http_headers": {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36",
             "Accept-Language": "en-US,en;q=0.9",
         },
     }
     last = None
-    for extra in attempts_for(mode, url):
+    errors: list[str] = []
+    for attempt_no, extra in enumerate(attempts_for(mode, url), 1):
         clear_folder(folder)
         opts = {**base, **extra}
-        # Some social sites reject generic HTTP fingerprints. Use curl_cffi's
-        # Chrome impersonation when available, while keeping YouTube unchanged.
         if needs_impersonation(url):
-            try:
-                import curl_cffi  # noqa: F401
-                opts["impersonate"] = "chrome"
-            except ImportError:
-                pass
+            opts.setdefault("impersonate", "chrome")
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 ydl.download([url])
         except yt_dlp.utils.DownloadError as e:
-            msg = str(e).lower()
             last = e
-            # Keep trying the remaining extractor/format strategies. When a site
-            # rate-limits a request, pause briefly before the next strategy.
-            if "http error 429" in msg or "too many requests" in msg or "rate-limit" in msg:
-                time.sleep(2)
+            clean = ANSI.sub("", str(e)).strip()
+            if clean:
+                errors.append(clean[:320])
+            msg = clean.lower()
+            # Keep trying when a platform temporarily rejects one request style.
+            if any(x in msg for x in ("http error 429", "too many requests", "rate-limit", "http error 403", "forbidden", "unable to download", "unable to extract", "requested format", "sign in to confirm", "challenge", "captcha")):
+                time.sleep(min(3, 0.5 + attempt_no * 0.25))
+                continue
+            # yt-dlp's extractors can fail for a single format while another
+            # format is still usable, so continue through the complete strategy list.
             continue
         path = pick_file(folder, mode)
         if path:
@@ -190,14 +247,8 @@ def fetch(url: str, folder: str, mode: str = "video") -> str:
                     mp4 = os.path.join(folder, os.path.splitext(os.path.basename(path))[0] + ".mp4")
                     try:
                         subprocess.run(
-                            [
-                                "ffmpeg", "-y", "-i", path,
-                                "-map", "0:v:0", "-map", "0:a?",
-                                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-                                "-c:a", "aac", "-b:a", "128k",
-                                "-movflags", "+faststart", mp4
-                            ],
-                            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180
+                            ["ffmpeg", "-y", "-i", path, "-map", "0:v:0", "-map", "0:a?", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", mp4],
+                            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180,
                         )
                         if os.path.exists(mp4) and os.path.getsize(mp4) > 0:
                             return mp4
@@ -205,8 +256,10 @@ def fetch(url: str, folder: str, mode: str = "video") -> str:
                         pass
             return path
     if last:
-        raise last
-    raise RuntimeError("no file produced (it may exceed the size limit)")
+        detail = errors[-1] if errors else str(last)
+        # Do not expose a huge yt-dlp traceback to the visitor.
+        raise RuntimeError(detail[:500])
+    raise RuntimeError("No media file was produced. The link may be private, login-only, unavailable, or temporarily blocked by the platform.")
 
 
 @app.get("/health")
