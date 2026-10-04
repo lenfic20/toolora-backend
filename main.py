@@ -97,6 +97,11 @@ def is_youtube(url: str) -> bool:
     return host == "youtube.com" or host.endswith(".youtube.com") or host == "youtu.be" or host.endswith(".youtu.be")
 
 
+def needs_impersonation(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return any(host == h or host.endswith("." + h) for h in ("instagram.com", "instagr.am", "tiktok.com", "twitter.com", "x.com"))
+
+
 def attempts_for(mode: str, url: str) -> list[dict]:
     if mode == "audio":
         formats = [{
@@ -146,6 +151,7 @@ def fetch(url: str, folder: str, mode: str = "video") -> str:
         "no_warnings": False,
         "retries": 3,
         "fragment_retries": 3,
+        "sleep_interval_requests": 1,
         "remote_components": {"ejs:github", "ejs:npm"},
         "js_runtimes": {"deno": {}},
         "http_headers": {
@@ -156,17 +162,25 @@ def fetch(url: str, folder: str, mode: str = "video") -> str:
     last = None
     for extra in attempts_for(mode, url):
         clear_folder(folder)
+        opts = {**base, **extra}
+        # Some social sites reject generic HTTP fingerprints. Use curl_cffi's
+        # Chrome impersonation when available, while keeping YouTube unchanged.
+        if needs_impersonation(url):
+            try:
+                import curl_cffi  # noqa: F401
+                opts["impersonate"] = "chrome"
+            except ImportError:
+                pass
         try:
-            with yt_dlp.YoutubeDL({**base, **extra}) as ydl:
+            with yt_dlp.YoutubeDL(opts) as ydl:
                 ydl.download([url])
         except yt_dlp.utils.DownloadError as e:
             msg = str(e).lower()
-            if is_youtube(url) and any(x in msg for x in ("player response", "sign in to confirm", "requested format", "unable to extract", "http error 400", "http error 403", "http error 429", "forbidden", "po token", "javascript", "challenge")):
-                last = e
-                continue
-            # Different public posts can expose different media formats. Keep trying the
-            # remaining extractor/format strategies before returning an error.
             last = e
+            # Keep trying the remaining extractor/format strategies. When a site
+            # rate-limits a request, pause briefly before the next strategy.
+            if "http error 429" in msg or "too many requests" in msg or "rate-limit" in msg:
+                time.sleep(2)
             continue
         path = pick_file(folder, mode)
         if path:

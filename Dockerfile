@@ -21,10 +21,10 @@ WORKDIR /app
 
 COPY requirements.txt .
 
-# yt-dlp[default] includes the matching yt-dlp-ejs package needed by current
+# yt-dlp[default,curl-cffi] includes the matching yt-dlp-ejs package needed by current
 # YouTube extraction. Install the latest stable package instead of a prerelease
 # so Render builds remain reproducible against a released dependency.
-RUN pip install --no-cache-dir -U "yt-dlp[default]" fastapi "uvicorn[standard]"
+RUN pip install --no-cache-dir -U "yt-dlp[default,curl-cffi]" fastapi "uvicorn[standard]"
 
 COPY main.py .
 
