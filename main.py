@@ -356,11 +356,14 @@ def attempts_for(mode: str, url: str) -> list[dict]:
                    {"format": "best"}]
     if is_instagram(url):
         # Default web API first, then the iOS-app API, then plain "best" as a last format.
-        out = [formats[0], {**formats[0], "extractor_args": {"instagram": {"app_id": ["ios"]}}}]
+        first = {"format": "b[ext=mp4]/bv*+ba/b", "format_sort": SORT} if mode == "video" else formats[0]
+        out = [first, {**first, "extractor_args": {"instagram": {"app_id": ["ios"]}}}]
         if mode == "video":
             out.append(formats[-1])
         return out
     if not is_youtube(url):
+        if mode == "video":  # TikTok / X / others serve ready-made MP4s: take one, skip the slow audio+video merge
+            return [{"format": "b[ext=mp4]/bv*+ba/b", "format_sort": SORT}] + formats[1:]
         return formats
 
     # YouTube's extractor changes frequently. Try current clients in a deliberate order.
