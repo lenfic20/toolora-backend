@@ -30,12 +30,12 @@ from starlette.background import BackgroundTask
 
 ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
 MAX_MB = int(os.getenv("MAX_FILESIZE_MB", "1024"))
-RATE = int(os.getenv("RATE_PER_MINUTE", "10"))
+RATE = int(os.getenv("RATE_PER_MINUTE", "60"))
 PROXY_SECRET = os.getenv("PROXY_SECRET", "")
 slots = asyncio.Semaphore(int(os.getenv("MAX_CONCURRENT", "3")))
 
 # Only these sites (and their subdomains) are accepted; this also blocks SSRF to internal hosts.
-ALLOWED_HOSTS = ("youtube.com", "youtu.be", "tiktok.com", "instagram.com", "instagr.am", "twitter.com", "x.com")
+ALLOWED_HOSTS = ("youtube.com", "youtu.be", "youtube-nocookie.com", "tiktok.com", "instagram.com", "instagr.am", "facebook.com", "fb.watch", "twitter.com", "x.com", "reddit.com", "redd.it", "vimeo.com", "dailymotion.com")
 
 app = FastAPI(title="Toolora backend")
 app.add_middleware(
@@ -192,73 +192,86 @@ def attempts_for(mode: str, url: str) -> list[dict]:
 
 
 def _download_direct(url: str, folder: str, mode: str, referer: str) -> str | None:
-    """Last-resort extractor for public pages that expose a direct media URL in HTML.
-    This is deliberately limited to the allowed social hosts and never follows arbitrary
-    redirects to internal/private addresses.
+    """Last-resort public-page media resolver.
+
+    Social sites frequently change the order/shape of their HTML metadata. Do not
+    depend on one exact attribute order or one JSON field. Collect every plausible
+    public media URL, normalize it, then try each candidate with browser-like headers.
+    This never bypasses login, CAPTCHA, DRM, or private content.
     """
     if curl_requests is None:
         return None
+    ua = "Mozilla/5.0 (Linux; Android 16; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Mobile Safari/537.36"
+    headers = {"User-Agent": ua, "Accept-Language": "en-US,en;q=0.9", "Referer": referer,
+               "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"}
     try:
-        r = curl_requests.get(
-            url,
-            headers={
-                "User-Agent": "Mozilla/5.0 (Linux; Android 16; K) AppleWebKit/537.36 Chrome/140.0 Mobile Safari/537.36",
-                "Accept-Language": "en-US,en;q=0.9",
-                "Referer": referer,
-            },
-            impersonate="chrome",
-            timeout=25,
-            allow_redirects=True,
-        )
+        r = curl_requests.get(url, headers=headers, impersonate="chrome", timeout=35, allow_redirects=True)
         if r.status_code >= 400:
             return None
-        text = r.text
-        candidates = []
-        # Standard OpenGraph/Twitter metadata.
-        for pat in (
-            r'<meta[^>]+property=["\'](?:og:video(?::secure_url)?|og:video:url)["\'][^>]+content=["\']([^"\']+)',
-            r'<meta[^>]+name=["\']twitter:player:stream["\'][^>]+content=["\']([^"\']+)',
-            r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)',
-        ):
-            candidates += re.findall(pat, text, re.I)
-        # Common JSON-embedded media fields used by TikTok/Instagram/X pages.
-        for pat in (
-            r'"playAddr"\s*:\s*"([^"]+)"',
-            r'"downloadAddr"\s*:\s*"([^"]+)"',
-            r'"video_url"\s*:\s*"([^"]+)"',
-            r'"video_versions"\s*:\s*\[\s*\{[^}]*?"url"\s*:\s*"([^"]+)"',
-            r'"contentUrl"\s*:\s*"([^"]+)"',
-        ):
-            candidates += re.findall(pat, text, re.I)
-        clean = []
+        text = r.text or ""
+        candidates: list[str] = []
+
+        # Parse all <meta ...> tags irrespective of attribute ordering.
+        for tag in re.findall(r"<meta\b[^>]*>", text, re.I):
+            attrs = {k.lower(): v for k, v in re.findall(r"([:\w-]+)\s*=\s*[\"']([^\"']*)[\"']", tag, re.I)}
+            key = (attrs.get("property") or attrs.get("name") or "").lower()
+            if key in {"og:video", "og:video:url", "og:video:secure_url", "og:image", "og:image:url",
+                       "twitter:image", "twitter:player:stream"}:
+                if attrs.get("content"):
+                    candidates.append(attrs["content"])
+
+        # JSON-LD and common social-media JSON fields.
+        patterns = [
+            r'"contentUrl"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"',
+            r'"video_url"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"',
+            r'"videoUrl"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"',
+            r'"playAddr"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"',
+            r'"downloadAddr"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"',
+            r'"play_addr"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"',
+            r'"display_url"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"',
+            r'"displayUrl"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"',
+            r'"src"\s*:\s*"(https?:\\/\\/[^"\\]+)"',
+            r'"url"\s*:\s*"(https?:\\/\\/[^"\\]+\.(?:mp4|m4v|webm|mov)(?:\\?[^"\\]*)?)"',
+            r'"url"\s*:\s*"(https?:\\/\\/[^"\\]+\.(?:jpg|jpeg|png|webp|gif)(?:\\?[^"\\]*)?)"',
+        ]
+        for pat in patterns:
+            candidates.extend(re.findall(pat, text, re.I))
+
+        # Openly embedded CDN media URLs.
+        candidates.extend(re.findall(r"https?:\\?/\\?/[^\"'<>\\s]+?(?:\\.mp4|\\.m4v|\\.webm|\\.mov|\\.jpg|\\.jpeg|\\.png|\\.webp|\\.gif)(?:\\?[^\"'<>\\s]*)?", text, re.I))
+
+        clean: list[str] = []
         for c in candidates:
-            c = html_lib.unescape(c).replace('\\/', '/').replace('\\u0026', '&').replace('\\u003D', '=').replace('\\u002F', '/')
-            try:
-                c = json.loads('"'+c.replace('"','\\"')+'"') if '\\u' in c else c
-            except Exception:
-                pass
+            c = html_lib.unescape(c)
+            for _ in range(3):
+                c = c.replace('\\/', '/').replace('\\u0026', '&').replace('\\u003D', '=').replace('\\u002F', '/').replace('\\u003F', '?').replace('\\u003A', ':')
             c = urljoin(str(r.url), c)
             if c.startswith(('https://', 'http://')) and c not in clean:
                 clean.append(c)
+
         if mode == "audio":
-            # Prefer an explicit audio URL if the page exposes one; otherwise grab
-            # the public video and extract its soundtrack with ffmpeg below.
-            audio_candidates = [c for c in clean if any(x in c.lower() for x in ('.mp3', '.m4a', '.aac', '.ogg', '.opus', 'audio'))]
-            if audio_candidates:
-                clean = audio_candidates + clean
-        if not clean:
-            return None
+            audio = [c for c in clean if any(x in c.lower().split('?')[0] for x in ('.mp3','.m4a','.aac','.ogg','.opus')) or 'audio' in c.lower()]
+            clean = audio + [c for c in clean if c not in audio]
+
         for media_url in clean:
             try:
-                head = curl_requests.head(media_url, headers={"Referer": referer, "User-Agent": "Mozilla/5.0"}, impersonate="chrome", timeout=15, allow_redirects=True)
-                if head.status_code >= 400:
+                mh = {"Referer": str(r.url), "User-Agent": ua, "Accept": "*/*"}
+                # HEAD is unreliable on many CDNs; probe with a tiny GET instead.
+                probe = curl_requests.get(media_url, headers={**mh, "Range": "bytes=0-0"}, impersonate="chrome", timeout=20, allow_redirects=True, stream=True)
+                if probe.status_code >= 400:
+                    probe.close()
                     continue
-                ct = (head.headers.get("content-type") or "").lower()
-                ext = ".mp4" if "video" in ct or media_url.lower().split('?')[0].endswith(('.mp4','.m4v')) else ".jpg" if "image" in ct else ".bin"
-                if mode == "audio" and ("audio" in ct or media_url.lower().split('?')[0].endswith(('.mp3','.m4a','.aac','.ogg','.opus'))):
-                    ext = ".mp3" if not media_url.lower().split('?')[0].endswith('.mp3') else ".mp3"
+                ct = (probe.headers.get("content-type") or "").lower()
+                probe.close()
+                path_no_q = media_url.lower().split('?')[0]
+                if "image/" in ct or path_no_q.endswith(('.jpg','.jpeg','.png','.webp','.gif')):
+                    ext = ".jpg" if "jpeg" in ct else ".png" if "png" in ct else ".webp" if "webp" in ct else ".gif" if "gif" in ct else ".jpg"
+                elif "audio/" in ct or path_no_q.endswith(('.mp3','.m4a','.aac','.ogg','.opus')):
+                    ext = ".mp3" if mode == "audio" else (".m4a" if path_no_q.endswith('.m4a') else ".mp3")
+                else:
+                    ext = ".mp4" if path_no_q.endswith(('.mp4','.m4v')) or 'video/' in ct else ".webm" if path_no_q.endswith('.webm') else ".bin"
                 out = os.path.join(folder, f"social-fallback{ext}")
-                with curl_requests.get(media_url, headers={"Referer": referer, "User-Agent": "Mozilla/5.0"}, impersonate="chrome", timeout=60, stream=True, allow_redirects=True) as dl:
+                with curl_requests.get(media_url, headers=mh, impersonate="chrome", timeout=120, stream=True, allow_redirects=True) as dl:
                     if dl.status_code >= 400:
                         continue
                     total = 0
@@ -276,7 +289,7 @@ def _download_direct(url: str, folder: str, mode: str, referer: str) -> str | No
                     continue
                 if mode == "audio" and not out.endswith('.mp3'):
                     mp3 = os.path.join(folder, "social-fallback.mp3")
-                    subprocess.run(["ffmpeg","-y","-i",out,"-vn","-codec:a","libmp3lame","-b:a","192k",mp3], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180)
+                    subprocess.run(["ffmpeg","-y","-i",out,"-vn","-codec:a","libmp3lame","-b:a","192k",mp3], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=240)
                     if os.path.exists(mp3) and os.path.getsize(mp3) > 0:
                         return mp3
                 return out
@@ -305,9 +318,12 @@ def fetch(url: str, folder: str, mode: str = "video") -> str:
         "socket_timeout": 30,
         "quiet": True,
         "no_warnings": False,
-        "retries": 5,
-        "fragment_retries": 5,
-        "extractor_retries": 3,
+        "retries": 12,
+        "fragment_retries": 12,
+        "extractor_retries": 6,
+        "file_access_retries": 8,
+        "continuedl": True,
+        "noprogress": True,
         "retry_sleep_functions": {"http": lambda n: min(8, 1.5 * (n + 1))},
         "concurrent_fragment_downloads": 1,
         "remote_components": {"ejs:github", "ejs:npm"},
@@ -359,11 +375,19 @@ def fetch(url: str, folder: str, mode: str = "video") -> str:
             return path
     # Final public-page fallback. This catches cases where a platform changes its
     # extractor but still exposes a direct media URL in the page metadata.
-    fallback = _download_direct(url, folder, mode,
+    referers = [
         "https://www.instagram.com/" if platform == "instagram" else
         "https://www.tiktok.com/" if platform == "tiktok" else
         "https://x.com/" if platform == "x" else
-        "https://www.youtube.com/")
+        "https://www.youtube.com/",
+        "https://www.google.com/",
+        "https://www.facebook.com/",
+    ]
+    fallback = None
+    for ref in referers:
+        fallback = _download_direct(url, folder, mode, ref)
+        if fallback:
+            break
     if fallback:
         if mode == "video":
             ext = os.path.splitext(fallback)[1].lower()
