@@ -36,8 +36,8 @@ MAX_MB = int(os.getenv("MAX_FILESIZE_MB", "200"))
 RATE = int(os.getenv("RATE_PER_MINUTE", "10"))
 PROXY_SECRET = os.getenv("PROXY_SECRET", "")
 OUT_PROXY = os.getenv("YTDLP_PROXY", "").strip()
-BUDGET = float(os.getenv("MAX_SECONDS", "75"))
-slots = asyncio.Semaphore(int(os.getenv("MAX_CONCURRENT", "4")))
+BUDGET = float(os.getenv("MAX_SECONDS", "100"))
+slots = asyncio.Semaphore(int(os.getenv("MAX_CONCURRENT", "3")))
 
 # Only these sites (and their subdomains) are accepted; this also blocks SSRF to internal hosts.
 ALLOWED_HOSTS = ("youtube.com", "youtu.be", "tiktok.com", "instagram.com", "instagr.am", "twitter.com", "x.com", "snapchat.com")
@@ -329,7 +329,7 @@ def download_to(u: str, path: str) -> None:
     limit = MAX_MB * 1024 * 1024
     got = 0
     req = urllib.request.Request(u, headers={"User-Agent": UA, "Referer": "https://www.instagram.com/"})
-    with open_url(req, 30) as r, open(path, "wb") as fh:
+    with open_url(req, 45) as r, open(path, "wb") as fh:
         while True:
             chunk = r.read(1 << 16)
             if not chunk:
@@ -483,7 +483,7 @@ def gallery_media(url: str, folder: str) -> tuple[list[dict], str]:
         with yt_dlp.YoutubeDL({
             "quiet": True, "no_warnings": True, "noplaylist": False,
             "extract_flat": False, "remote_components": ["ejs:github"],
-            "socket_timeout": 14, "retries": 3,
+            "socket_timeout": 25, "retries": 4,
         }) as ydl:
             info = ydl.extract_info(normalize_url(url), download=False)
     except Exception:
@@ -595,7 +595,7 @@ def fetch(url: str, folder: str, mode: str = "video") -> str:
         "noplaylist": True,
         "restrictfilenames": True,
         "max_filesize": MAX_MB * 1024 * 1024,
-        "socket_timeout": 14,
+        "socket_timeout": 20,
         "quiet": True,
         "no_warnings": False,
         "retries": 3,
@@ -605,7 +605,7 @@ def fetch(url: str, folder: str, mode: str = "video") -> str:
     if OUT_PROXY:
         base["proxy"] = OUT_PROXY
     if is_youtube(url):
-        base.update({"retries": 3, "fragment_retries": 3, "socket_timeout": 14, "concurrent_fragment_downloads": 3})
+        base.update({"retries": 4, "fragment_retries": 5, "socket_timeout": 20, "concurrent_fragment_downloads": 2})
     cookie_path = None
     if COOKIES:
         fd, cookie_path = tempfile.mkstemp(prefix="ck_", suffix=".txt")  # yt-dlp rewrites its cookie file, so give it a private copy
