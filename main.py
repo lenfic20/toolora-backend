@@ -1,5 +1,5 @@
 """Toolora backend: POST /download {"url": "...", "mode": "video" | "audio"} -> returns the file.
-  mode "video" (default): best quality MP4 that fits the size cap; social carousels may return a ZIP of all slides.
+  mode "video" (default): best quality MP4 that fits the size cap.
   mode "audio": the sound only, as an MP3.
 
 Run locally:  uvicorn main:app --reload
@@ -15,7 +15,7 @@ Env vars (all optional):
   MAX_SECONDS       give up on a link after this many seconds of trying different methods (default 80)
   YTDLP_PROXY       (optional) proxy URL such as http://user:pass@host:port, used for every outgoing request
 """
-import asyncio, base64, hmac, html, json, os, re, shutil, subprocess, tempfile, time, zipfile
+import asyncio, base64, hmac, html, os, re, shutil, subprocess, tempfile, time
 import urllib.error, urllib.request
 from typing import Literal
 from collections import defaultdict, deque
@@ -39,7 +39,7 @@ BUDGET = float(os.getenv("MAX_SECONDS", "80"))
 slots = asyncio.Semaphore(int(os.getenv("MAX_CONCURRENT", "3")))
 
 # Only these sites (and their subdomains) are accepted; this also blocks SSRF to internal hosts.
-ALLOWED_HOSTS = ("youtube.com", "youtu.be", "tiktok.com", "instagram.com", "instagr.am", "twitter.com", "x.com", "snapchat.com", "t.snapchat.com")
+ALLOWED_HOSTS = ("youtube.com", "youtu.be", "tiktok.com", "instagram.com", "instagr.am", "twitter.com", "x.com")
 
 app = FastAPI(title="Toolora backend")
 app.add_middleware(
@@ -116,16 +116,6 @@ IG_CDN = ("cdninstagram.com", "fbcdn.net")  # the only hosts the fallback downlo
 def is_instagram(url: str) -> bool:
     host = (urlparse(url).hostname or "").lower()
     return host in ("instagram.com", "instagr.am") or host.endswith(".instagram.com") or host.endswith(".instagr.am")
-
-
-def is_tiktok(url: str) -> bool:
-    host = (urlparse(url).hostname or "").lower()
-    return host == "tiktok.com" or host.endswith(".tiktok.com")
-
-
-def is_snapchat(url: str) -> bool:
-    host = (urlparse(url).hostname or "").lower()
-    return host == "snapchat.com" or host.endswith(".snapchat.com") or host == "t.snapchat.com"
 
 
 def load_cookies() -> str:
@@ -259,16 +249,12 @@ def _uniq(xs):
 def ig_media_urls(page: str):
     """Pull direct video / picture URLs out of an Instagram embed or post page."""
     t = _unesc(page)
-    vids = re.findall(r'video_url\*"\s*:\s*\*"(https?://[^"\\\s]+)', t)
+    vids = re.findall(r'video_url\\*"\s*:\s*\\*"(https?://[^"\\\s]+)', t)
     vids += re.findall(r'<meta[^>]+property=["\']og:video(?::secure_url|:url)?["\'][^>]+content=["\'](https?://[^"\']+)', t)
     vids += re.findall(r'<video[^>]+src=["\'](https?://[^"\']+)', t)
-    imgs = re.findall(r'display_url\*"\s*:\s*\*"(https?://[^"\\\s]+)', t)
+    imgs = re.findall(r'display_url\\*"\s*:\s*\\*"(https?://[^"\\\s]+)', t)
     imgs += re.findall(r'class=["\'][^"\']*EmbeddedMediaImage[^"\']*["\'][^>]+src=["\'](https?://[^"\']+)', t)
     imgs += re.findall(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\'](https?://[^"\']+)', t)
-    # Carousel JSON can contain many CDN image URLs without the display_url key.
-    for u in re.findall(r'https://[^"\\\s]+', t):
-        if any(h in (urlparse(u).hostname or "").lower() for h in IG_CDN) and re.search(r'\.(?:jpe?g|png|webp)(?:[?&]|$)', u, re.I):
-            imgs.append(u.rstrip('\\'))
     return _uniq(vids), _uniq(imgs)
 
 
@@ -297,10 +283,10 @@ def page_text(url: str) -> str:
         return ""
 
 
-def download_to(u: str, path: str, referer: str = "https://www.instagram.com/") -> None:
+def download_to(u: str, path: str) -> None:
     limit = MAX_MB * 1024 * 1024
     got = 0
-    req = urllib.request.Request(u, headers={"User-Agent": UA, "Referer": referer})
+    req = urllib.request.Request(u, headers={"User-Agent": UA, "Referer": "https://www.instagram.com/"})
     with open_url(req, 45) as r, open(path, "wb") as fh:
         while True:
             chunk = r.read(1 << 16)
@@ -324,162 +310,8 @@ def to_mp3(src: str, folder: str, stem: str) -> str:
     return out
 
 
-def _json_script_objects(page: str):
-    """Yield JSON objects embedded in application/json script tags and common hydration script ids."""
-    text = _unesc(page)
-    chunks = re.findall(r'<script[^>]*(?:type=["\\\']application/json["\\\']|id=["\\\'][^"\\\']*(?:UNIVERSAL_DATA_FOR_REHYDRATION|__NEXT_DATA__|__DEFAULT_SCOPE__)[^"\\\']*["\\\'])[^>]*>(.*?)</script>', text, re.I | re.S)
-    for chunk in chunks:
-        chunk = html.unescape(chunk).strip()
-        if not chunk:
-            continue
-        try:
-            yield json.loads(chunk)
-        except Exception:
-            continue
-
-
-def _walk(obj):
-    if isinstance(obj, dict):
-        yield obj
-        for v in obj.values():
-            yield from _walk(v)
-    elif isinstance(obj, list):
-        for v in obj:
-            yield from _walk(v)
-
-
-def tiktok_photo_urls(page: str):
-    """Read TikTok photo-mode image URLs from the page hydration JSON."""
-    out = []
-    for root in _json_script_objects(page):
-        for obj in _walk(root):
-            image_post = obj.get("imagePost") if isinstance(obj, dict) else None
-            if not isinstance(image_post, dict):
-                continue
-            images = image_post.get("images") or []
-            for item in images:
-                if not isinstance(item, dict):
-                    continue
-                image_url = item.get("imageURL") or {}
-                urls = image_url.get("urlList") if isinstance(image_url, dict) else None
-                if isinstance(urls, list):
-                    for u in urls:
-                        if isinstance(u, str) and u.startswith("https://"):
-                            out.append(u)
-                            break
-    if not out:
-        # TikTok occasionally changes the hydration shape; recover obvious CDN image URLs as a last resort.
-        for u in re.findall(r'https://[^"\\\\\s]+', _unesc(page)):
-            if "tiktokcdn.com" in u.lower() and ("image" in u.lower() or "obj/" in u.lower()):
-                out.append(u.rstrip('\\\\'))
-    return _uniq(out)
-
-
-def snapchat_media_urls(page: str):
-    """Read Snapchat Spotlight's public CDN video URL from hydration JSON, with HTML fallbacks."""
-    videos = []
-    images = []
-    for root in _json_script_objects(page):
-        for obj in _walk(root):
-            if not isinstance(obj, dict):
-                continue
-            meta = obj.get("videoMetadata")
-            if isinstance(meta, dict):
-                for k in ("contentUrl", "url"):
-                    u = meta.get(k)
-                    if isinstance(u, str) and u.startswith("https://"):
-                        videos.append(u)
-            snap_urls = obj.get("snapUrls")
-            if isinstance(snap_urls, dict):
-                for k in ("mediaUrl", "contentUrl"):
-                    u = snap_urls.get(k)
-                    if isinstance(u, str) and u.startswith("https://"):
-                        videos.append(u)
-            snap_list = obj.get("snapList")
-            if isinstance(snap_list, list):
-                for item in snap_list:
-                    if isinstance(item, dict):
-                        for k in ("mediaUrl", "contentUrl"):
-                            u = item.get(k)
-                            if isinstance(u, str) and u.startswith("https://"):
-                                videos.append(u)
-                        prev = item.get("mediaPreviewUrl")
-                        if isinstance(prev, dict):
-                            u = prev.get("value")
-                            if isinstance(u, str) and u.startswith("https://"):
-                                images.append(u)
-            for k in ("contentUrl", "mediaUrl"):
-                u = obj.get(k)
-                if isinstance(u, str) and u.startswith("https://"):
-                    videos.append(u)
-    if not videos:
-        for u in re.findall(r'https://[^"\\\\\s]+', _unesc(page)):
-            if "sc-cdn.net" in u.lower() and re.search(r'\.(?:mp4|m3u8)(?:[?&]|$)', u, re.I):
-                videos.append(u.rstrip('\\\\'))
-    return _uniq(videos), _uniq(images)
-
-
-def zip_media(paths: list[str], folder: str, stem: str) -> str:
-    """Bundle multiple downloaded media items so the browser can unpack and show each slide."""
-    if not paths:
-        raise RuntimeError("no media files were produced")
-    out = os.path.join(folder, stem + ".zip")
-    used = set()
-    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as z:
-        for i, path in enumerate(paths, 1):
-            base = os.path.basename(path)
-            if not base or base in used:
-                base = f"slide-{i}{os.path.splitext(path)[1].lower() or '.bin'}"
-            used.add(base)
-            z.write(path, base)
-    return out
-
-
-def download_gallery(urls: list[str], folder: str, stem: str, referer: str, image_only: bool = True) -> str:
-    """Download all public gallery items and return a zip containing them."""
-    paths = []
-    last = None
-    for i, u in enumerate(_uniq(urls), 1):
-        path = os.path.join(folder, f"{stem}-{i:02d}" + (os.path.splitext(urlparse(u).path)[1].lower() if os.path.splitext(urlparse(u).path)[1].lower() in IMAGE_EXT else ".jpg"))
-        try:
-            download_to(u, path, referer)
-            paths.append(path)
-        except Exception as e:
-            last = e
-    if len(paths) > 1:
-        return zip_media(paths, folder, stem)
-    if len(paths) == 1:
-        return paths[0]
-    raise last or RuntimeError("no gallery media could be downloaded")
-
-
-def tiktok_photo_fallback(url: str, folder: str, mode: str) -> str:
-    if mode == "audio":
-        raise RuntimeError("TikTok photo posts do not expose a separate audio file here")
-    text = page_text(url)
-    if not text:
-        raise RuntimeError("TikTok did not return the photo post page")
-    imgs = tiktok_photo_urls(text)
-    if not imgs:
-        raise RuntimeError("TikTok did not return the slideshow images")
-    return download_gallery(imgs, folder, "tiktok-slideshow", "https://www.tiktok.com/", image_only=True)
-
-
-def snapchat_fallback(url: str, folder: str, mode: str) -> str:
-    text = page_text(url)
-    if not text:
-        raise RuntimeError("Snapchat did not return the public Spotlight page")
-    vids, _ = snapchat_media_urls(text)
-    if not vids:
-        raise RuntimeError("Snapchat did not expose a downloadable public video for this link")
-    u = vids[0]
-    path = os.path.join(folder, "snapchat-spotlight.mp4")
-    download_to(u, path, "https://www.snapchat.com/")
-    return to_mp3(path, folder, "snapchat-spotlight") if mode == "audio" else path
-
-
 def instagram_fallback(url: str, folder: str, mode: str) -> str:
-    """Last resort for Instagram: read public embed/post HTML and download all carousel media we can see."""
+    """Last resort when yt-dlp can't read an Instagram post: read the public embed page and download the media directly."""
     m = re.search(r"instagram\.com/(?:[^/?#]+/)?(?:p|reels?|tv)/([A-Za-z0-9_-]+)", url)
     if not m:
         raise RuntimeError("not a post, reel or video link")
@@ -494,46 +326,29 @@ def instagram_fallback(url: str, folder: str, mode: str) -> str:
         v, i = ig_media_urls(text)
         vids += [x for x in v if cdn_ok(x)]
         imgs += [x for x in i if cdn_ok(x)]
-        if vids or len(imgs) > 1:
+        if vids:
             break
     stem = f"instagram_{code}"
+    last = None
+    for u in _uniq(vids):
+        path = os.path.join(folder, stem + ".mp4")
+        try:
+            download_to(u, path)
+            return to_mp3(path, folder, stem) if mode == "audio" else path
+        except Exception as e:
+            last = e
     if mode == "audio":
-        last = None
-        for u in _uniq(vids):
-            path = os.path.join(folder, stem + ".mp4")
-            try:
-                download_to(u, path, "https://www.instagram.com/")
-                return to_mp3(path, folder, stem)
-            except Exception as e:
-                last = e
         raise last or RuntimeError("this post has no audio track")
-    # For carousels, return every picture and video we can recover, in source order where possible.
-    all_media = _uniq(vids + imgs)
-    if len(all_media) > 1:
-        paths = []
-        last = None
-        for i, u in enumerate(all_media, 1):
-            ext = os.path.splitext(urlparse(u).path)[1].lower()
-            if ext not in IMAGE_EXT and ext not in (".mp4", ".webm", ".mov"):
-                ext = ".mp4" if u in vids else ".jpg"
-            path = os.path.join(folder, f"{stem}-{i:02d}{ext}")
-            try:
-                download_to(u, path, "https://www.instagram.com/")
-                paths.append(path)
-            except Exception as e:
-                last = e
-        if len(paths) > 1:
-            return zip_media(paths, folder, stem)
-        if len(paths) == 1:
-            return paths[0]
-        raise last or RuntimeError("Instagram did not return any media for this link")
-    if all_media:
-        u = all_media[0]
+    for u in _uniq(imgs):
         ext = os.path.splitext(urlparse(u).path)[1].lower()
-        path = os.path.join(folder, stem + (ext if ext in IMAGE_EXT or ext in (".mp4", ".webm", ".mov") else ".jpg"))
-        download_to(u, path, "https://www.instagram.com/")
-        return path
-    raise RuntimeError("Instagram did not return any media for this link")
+        path = os.path.join(folder, stem + (ext if ext in IMAGE_EXT else ".jpg"))
+        try:
+            download_to(u, path)
+            return path
+        except Exception as e:
+            last = e
+    raise last or RuntimeError("Instagram did not return any media for this link")
+
 
 def attempts_for(mode: str, url: str) -> list[dict]:
     if mode == "audio":
@@ -555,8 +370,6 @@ def attempts_for(mode: str, url: str) -> list[dict]:
             out.append(formats[-1])
         return out
     if not is_youtube(url):
-        if is_snapchat(url):
-            return [{"format": "best", "remote_components": ["ejs:github"]}]
         if mode == "video":  # TikTok / X / others serve ready-made MP4s: take one, skip the slow audio+video merge
             return [{"format": "b[ext=mp4]/bv*+ba/b", "format_sort": SORT}] + formats[1:]
         return formats
@@ -591,23 +404,12 @@ def pick_file(folder: str, mode: str) -> str | None:
     return os.path.join(folder, max(files, key=lambda f: os.path.getsize(os.path.join(folder, f))))
 
 
-def pick_media_output(folder: str, mode: str) -> str | None:
-    """Pick a normal media file, or zip a multi-item social carousel when yt-dlp produced several files."""
-    if mode == "audio":
-        return pick_file(folder, mode)
-    files = [f for f in os.listdir(folder) if not FRAGMENT.search(f)]
-    media = [f for f in files if f.lower().endswith((".mp4", ".mkv", ".webm", ".mov") + IMAGE_EXT)]
-    if len(media) > 1:
-        return zip_media([os.path.join(folder, f) for f in sorted(media)], folder, "social-carousel")
-    return os.path.join(folder, media[0]) if media else None
-
-
 def fetch(url: str, folder: str, mode: str = "video") -> str:
     url = normalize_url(url)
     base = {
         "outtmpl": os.path.join(folder, "%(title).80B [%(id)s].%(ext)s"),
         "merge_output_format": "mp4",
-        "noplaylist": not (is_instagram(url) or is_tiktok(url)),
+        "noplaylist": True,
         "restrictfilenames": True,
         "max_filesize": MAX_MB * 1024 * 1024,
         "socket_timeout": 20,
@@ -667,45 +469,14 @@ def fetch(url: str, folder: str, mode: str = "video") -> str:
                 if mode == "audio" or "requested format" not in msg:
                     raise
                 continue
-            path = pick_media_output(folder, mode)
+            path = pick_file(folder, mode)
             if path:
-                # Carousel posts need all slides, not just the largest downloaded file. For Instagram
-                # post/reel pages and TikTok photo pages, do a page-level gallery pass after yt-dlp
-                # succeeds so mixed photo/video carousels are not silently reduced to one item.
-                if mode == "video" and is_instagram(url) and re.search(r"/p/", urlparse(url).path, re.I):
-                    try:
-                        gallery = instagram_fallback(url, folder, mode)
-                        if gallery.lower().endswith(".zip"):
-                            return gallery
-                    except Exception:
-                        pass
-                if mode == "video" and is_tiktok(url) and "/photo/" in urlparse(url).path.lower():
-                    try:
-                        gallery = tiktok_photo_fallback(url, folder, mode)
-                        if gallery.lower().endswith(".zip"):
-                            return gallery
-                    except Exception:
-                        pass
                 return path
             capped = True
         if insta:
             clear_folder(folder)
             try:
                 return instagram_fallback(url, folder, mode)
-            except Exception as e:
-                if last is None:
-                    last = e
-        if is_tiktok(url) and re.search(r"/(?:photo|video)/", urlparse(url).path, re.I):
-            clear_folder(folder)
-            try:
-                return tiktok_photo_fallback(url, folder, mode)
-            except Exception as e:
-                if last is None:
-                    last = e
-        if is_snapchat(url):
-            clear_folder(folder)
-            try:
-                return snapchat_fallback(url, folder, mode)
             except Exception as e:
                 if last is None:
                     last = e
@@ -735,7 +506,7 @@ async def download(req: Req, request: Request):
         ip = request.headers.get("cf-connecting-ip") or (request.client.host if request.client else "?")
     check_rate(ip)
     if not valid_url(req.url):
-        raise HTTPException(400, "Paste a link from YouTube, TikTok, Instagram, X (Twitter) or Snapchat Spotlight.")
+        raise HTTPException(400, "Paste a link from YouTube, TikTok, Instagram or X (Twitter).")
     folder = tempfile.mkdtemp(prefix="dl_")
     cleanup = BackgroundTask(shutil.rmtree, folder, ignore_errors=True)
     try:
@@ -748,7 +519,7 @@ async def download(req: Req, request: Request):
         what = "extract the audio from" if req.mode == "audio" else "download"
         raise HTTPException(422, f"Couldn't {what} that video: {reason}")
     ext = os.path.splitext(path)[1].lower()
-    media = {".mp3": "audio/mpeg", ".mp4": "video/mp4", ".webm": "video/webm", ".mkv": "video/x-matroska", ".mov": "video/quicktime", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp", ".zip": "application/zip"}.get(ext, "application/octet-stream")
+    media = {".mp3": "audio/mpeg", ".mp4": "video/mp4", ".webm": "video/webm", ".mkv": "video/x-matroska", ".mov": "video/quicktime", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp"}.get(ext, "application/octet-stream")
     return FileResponse(path, media_type=media, filename=os.path.basename(path), background=cleanup)
 
 
