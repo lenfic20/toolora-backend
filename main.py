@@ -372,7 +372,7 @@ def is_snapchat(url: str) -> bool:
 
 
 # Hosts that picture / video files may be fetched from (this also blocks SSRF through the "file" mode).
-MEDIA_HOSTS = ("tiktokcdn.com", "tiktokcdn-us.com", "tiktokv.com", "tiktokv.us", "byteoversea.com", "ibytedtos.com",
+MEDIA_HOSTS = ("tiktokcdn.com", "tiktokcdn-us.com", "tiktokcdn-eu.com", "tiktokv.com", "tiktokv.us", "byteoversea.com", "ibytedtos.com",
                "ibyteimg.com", "muscdn.com", "tikwm.com", "cdninstagram.com", "fbcdn.net", "sc-cdn.net", "snapchat.com")
 
 
@@ -469,11 +469,12 @@ def tiktok_items_from(item: dict) -> list[dict]:
     out = []
     for im in imgs:
         urls = [u for u in (((im or {}).get("imageURL") or {}).get("urlList") or []) if isinstance(u, str) and media_ok(u)]
-        if urls:
-            out.append({"kind": "image", "src": next((u for u in urls if re.search(r"\.jpe?g(\?|$)", u)), urls[0])})
-    vid = item.get("video") or {}
-    if out and (vid.get("duration") or 0) > 0 and (vid.get("playAddr") or vid.get("downloadAddr")):
-        out.append({"kind": "video", "via": "page"})  # the post also carries a real video: fetched with the normal video route
+        if urls:  # prefer JPEG, then anything that is not HEIC (browsers can't show HEIC)
+            best = (next((u for u in urls if re.search(r"\.jpe?g(\?|$)", urlparse(u).path + "?")), None)
+                    or next((u for u in urls if "heic" not in u.lower()), None) or urls[0])
+            out.append({"kind": "image", "src": best})
+    # TikTok photo posts never contain a separate video (the "video" field only holds the soundtrack),
+    # so no extra video slide is added: it could only fail.
     return out
 
 
@@ -490,8 +491,14 @@ def tiktok_items(url: str) -> list[dict]:
     text = page_text(url)
     item = tiktok_item(text) if text else None
     if item is not None:
-        return tiktok_items_from(item)
-    return tikwm_items(url)
+        out = tiktok_items_from(item)
+        if out or not (item.get("imagePost") or "/photo/" in url.lower()):
+            return out  # a normal video post: empty list = use the normal video route
+    try:  # page blocked / changed, or a photo post whose pictures weren't readable: ask the second source
+        return tikwm_items(url)
+    except Exception as e:
+        print(f"[toolora] tikwm failed {url[:120]}: {ANSI.sub('', str(e))[:200]}", flush=True)
+        return []
 
 
 def _cookie_copy() -> str | None:
@@ -557,8 +564,8 @@ def info_items(url: str) -> list[dict]:
     if hit and time.time() - hit[0] < 300:
         return hit[1]
     url = normalize_url(key)
-    try:
-        items = instagram_items(url) if is_instagram(url) else tiktok_items(url)
+    try:  # TikTok keeps the original link: its /photo/ page is the one that lists the pictures
+        items = instagram_items(url) if is_instagram(url) else tiktok_items(key)
     except Exception as e:
         print(f"[toolora] slides info failed {key[:120]}: {ANSI.sub('', str(e))[:300]}", flush=True)
         items = []
@@ -589,6 +596,48 @@ def snap_resolve(url: str) -> str:
     return final if is_snapchat(final) else url
 
 
+SNAP_VARIANT = re.compile(r"\.\d+\.(IRZXSOY)$")
+SNAP_CLEAN = "1034"  # Snapchat's media variant without the burned-in "Snapchat @user" watermark (".27." carries it)
+
+
+def snap_clean_urls(u: str) -> list[str]:
+    """Watermark-free variants of a Spotlight media link (empty when the link has no variant number).
+    The same file is tried on its own host first, then on Snapchat's main CDN, which serves it for every Spotlight."""
+    p = urlparse(u)
+    if not SNAP_VARIANT.search(p.path):
+        return []
+    path = SNAP_VARIANT.sub(r".%s.\1" % SNAP_CLEAN, p.path)
+    name = path.rsplit("/", 1)[-1]
+    return _uniq([f"https://{p.hostname}{path}", f"https://cf-st.sc-cdn.net/d/{name}"])
+
+
+def snap_story_urls(page: str, url: str) -> list[str]:
+    """Media links of the Spotlight that `url` points to, read from the page's Next.js data."""
+    m = re.search(r'<script[^>]+id="__NEXT_DATA__"[^>]*>(.*?)</script>', page, re.S)
+    if not m:
+        return []
+    try:
+        props = json.loads(m.group(1))["props"]["pageProps"]
+    except (ValueError, KeyError, TypeError):
+        return []
+    want = re.search(r"/spotlight/([\w-]+)", urlparse(url).path)
+    want = want.group(1) if want else None
+    stories = ((props.get("spotlightFeed") or {}).get("spotlightStories")) or []
+    picked = [s for s in stories if want and (((s or {}).get("story") or {}).get("storyId") or {}).get("value") == want]
+    if not picked and not want:
+        picked = [s for s in stories if ((s or {}).get("story") or {}).get("snapList")][:1]
+    out = []
+    for s in picked:
+        for snap in ((s.get("story") or {}).get("snapList") or []):
+            mu = ((snap or {}).get("snapUrls") or {}).get("mediaUrl")
+            if isinstance(mu, str):
+                out.append(mu)
+        cu = (((s.get("metadata") or {}).get("videoMetadata") or {}).get("contentUrl"))
+        if isinstance(cu, str):
+            out.append(cu)
+    return [x for x in _uniq(out) if media_ok(x)]
+
+
 def snap_video_urls(page: str) -> list[str]:
     t = re.sub(r"\\+u002[Ff]", "/", _unesc(page))  # Next.js pages write "/" as \u002F
     found = re.findall(r'<meta[^>]+property=["\']og:video(?::secure_url|:url)?["\'][^>]+content=["\'](https?://[^"\']+)', t)
@@ -598,12 +647,16 @@ def snap_video_urls(page: str) -> list[str]:
     return [x for x in _uniq(found) if media_ok(x)]
 
 
-def snapchat_fallback(url: str, folder: str, mode: str) -> str:
+def snapchat_fallback(url: str, folder: str, mode: str, clean_only: bool = False) -> str:
+    """Download a Spotlight. Watermark-free variants are always tried first; with clean_only, nothing else."""
     text = page_text(url)
     if not text:
         raise RuntimeError("Snapchat didn't return the page for this link")
+    raw = snap_story_urls(text, url) or snap_video_urls(text)
+    clean = _uniq([c for u in raw for c in snap_clean_urls(u) if media_ok(c)])
+    cands = clean if clean_only else _uniq(clean + raw)
     last = None
-    for u in snap_video_urls(text):
+    for u in cands:
         path = os.path.join(folder, "snapchat_spotlight.mp4")
         try:
             ctype = download_media(u, path)
@@ -671,6 +724,7 @@ def pick_file(folder: str, mode: str) -> str | None:
 
 
 def fetch(url: str, folder: str, mode: str = "video") -> str:
+    orig = url.strip()
     url = normalize_url(url)
     if is_snapchat(url):
         url = snap_resolve(url)
@@ -706,6 +760,12 @@ def fetch(url: str, folder: str, mode: str = "video") -> str:
     insta = is_instagram(url)
     snap = is_snapchat(url)
     last = None
+    if snap:  # yt-dlp only knows the watermarked file, so the watermark-free version is tried first
+        try:
+            return snapchat_fallback(url, folder, mode, clean_only=True)
+        except Exception as e:
+            print(f"[toolora] snapchat clean download failed {url[:120]}: {ANSI.sub('', str(e))[:200]}", flush=True)
+            clear_folder(folder)
     try:
         capped = False  # a download that finished without a file means the size cap was hit
         started, blocked = time.monotonic(), 0
@@ -726,6 +786,8 @@ def fetch(url: str, folder: str, mode: str = "video") -> str:
                 last = e
                 if insta or snap:  # Instagram is flaky from servers: always try the next strategy
                     continue
+                if is_tiktok(url) and mode == "video" and isinstance(e, yt_dlp.utils.DownloadError):
+                    break  # e.g. a photo post yt-dlp can't read: go straight to the picture fallback below
                 if not isinstance(e, yt_dlp.utils.DownloadError):
                     raise
                 msg = str(e).lower()
@@ -748,6 +810,15 @@ def fetch(url: str, folder: str, mode: str = "video") -> str:
             clear_folder(folder)
             try:
                 return instagram_fallback(url, folder, mode)
+            except Exception as e:
+                if last is None:
+                    last = e
+        if is_tiktok(url) and mode == "video":  # photo posts that yt-dlp can't read: hand back the first picture
+            clear_folder(folder)
+            try:
+                pics = [x for x in info_items(orig) if x.get("kind") == "image" and x.get("src")]
+                if pics:
+                    return fetch_media_file(pics[0]["src"], folder)[0]
             except Exception as e:
                 if last is None:
                     last = e
