@@ -7,13 +7,19 @@ directory = "./public"
 binding = "ASSETS"
 run_worker_first = ["/api/*", "/download"]
 
+[triggers]
+# Every 2 minutes: pings the downloader so the free Render server never falls asleep (a cold start takes 30-60 s),
+# and sends the daily reminder notification to signed-in users who are due one (24 hours after their last one).
+crons = ["*/2 * * * *"]
+
 [[d1_databases]]
 binding = "DB"
 database_name = "toolora"
-database_id = "PASTE_DATABASE_ID_HERE"
+database_id = "b63698f1-6506-4027-a45a-e9897143f52b"
 
 [vars]
-# Public value from Google Cloud Console. Leave empty to hide the Google button.
 GOOGLE_CLIENT_ID = "889873028509-59ka6sd14jjeeqtrvaitk564a2rs9ns1.apps.googleusercontent.com"
-# Public address of the FastAPI downloader, for example https://toolora-api.onrender.com
 BACKEND_URL = "https://toolora-backend-thze.onrender.com"
+# Daily reminder notifications (web push). The matching private key is the secret VAPID_PRIVATE_KEY.
+VAPID_PUBLIC_KEY = "BMjPUFv6bqAIUK8jZ6ygqR4ZvI77lPYHWjsOdSa6EIfjJOujjAwnw5vlUx-42QHft1GxidHcXCJc0oqLi8Vydo8"
+VAPID_SUBJECT = "https://smed.fyi"

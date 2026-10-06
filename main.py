@@ -1,6 +1,9 @@
 """Toolora backend: POST /download {"url": "...", "mode": "video" | "audio"} -> returns the file.
   mode "video" (default): best quality MP4 that fits the size cap.
   mode "audio": the sound only, as an MP3.
+  mode "info":  TikTok / Instagram only. Returns {"items": [...]} listing every picture / video of a post, so a photo
+                slideshow or mixed carousel can be shown. An empty list means "treat it as a normal single video".
+  mode "file":  fetches one picture / video file by its direct CDN link (only well-known media hosts are allowed).
 
 Run locally:  uvicorn main:app --reload
 Env vars (all optional):
@@ -14,18 +17,20 @@ Env vars (all optional):
                     Alternatives: COOKIES_B64 (the same file, base64-encoded) or a Render Secret File named cookies.txt
   MAX_SECONDS       give up on a link after this many seconds of trying different methods (default 80)
   YTDLP_PROXY       (optional) proxy URL such as http://user:pass@host:port, used for every outgoing request
+  YT_PROXY          (optional) proxy URL used ONLY for YouTube (overrides YTDLP_PROXY for YouTube links), so a paid
+                    residential proxy is only used where it is needed
 """
-import asyncio, base64, hmac, html, os, re, shutil, subprocess, tempfile, time
+import asyncio, base64, hmac, html, json, os, re, shutil, subprocess, tempfile, time
 import urllib.error, urllib.request
 from typing import Literal
 from collections import defaultdict, deque
-from urllib.parse import parse_qs, unquote, urljoin, urlparse
+from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse
 
 import yt_dlp
 import yt_dlp.cookies
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
@@ -35,11 +40,13 @@ MAX_MB = int(os.getenv("MAX_FILESIZE_MB", "200"))
 RATE = int(os.getenv("RATE_PER_MINUTE", "10"))
 PROXY_SECRET = os.getenv("PROXY_SECRET", "")
 OUT_PROXY = os.getenv("YTDLP_PROXY", "").strip()
+YT_PROXY = os.getenv("YT_PROXY", "").strip()
 BUDGET = float(os.getenv("MAX_SECONDS", "80"))
 slots = asyncio.Semaphore(int(os.getenv("MAX_CONCURRENT", "3")))
+file_slots = asyncio.Semaphore(4)  # picture / slide file transfers (light, so they do not wait behind video downloads)
 
 # Only these sites (and their subdomains) are accepted; this also blocks SSRF to internal hosts.
-ALLOWED_HOSTS = ("youtube.com", "youtu.be", "tiktok.com", "instagram.com", "instagr.am", "twitter.com", "x.com")
+ALLOWED_HOSTS = ("youtube.com", "youtu.be", "tiktok.com", "instagram.com", "instagr.am", "twitter.com", "x.com", "snapchat.com")
 
 app = FastAPI(title="Toolora backend")
 app.add_middleware(
@@ -51,6 +58,7 @@ app.add_middleware(
 )
 
 hits: dict[str, deque] = defaultdict(deque)
+fhits: dict[str, deque] = defaultdict(deque)  # slide info / picture file requests have their own, more generous allowance
 
 
 def from_proxy(request: Request) -> bool:
@@ -61,18 +69,19 @@ def from_proxy(request: Request) -> bool:
     return hmac.compare_digest(sent.encode(), PROXY_SECRET.encode())
 
 
-def check_rate(ip: str) -> None:
-    now, q = time.time(), hits[ip]
+def check_rate(ip: str, bucket=None, limit: int | None = None) -> None:
+    now, q = time.time(), (hits if bucket is None else bucket)[ip]
+    limit = RATE if limit is None else limit
     while q and now - q[0] > 60:
         q.popleft()
-    if len(q) >= RATE:
+    if len(q) >= limit:
         raise HTTPException(429, "Too many requests. Try again in a minute.")
     q.append(now)
 
 
 class Req(BaseModel):
     url: str
-    mode: Literal["video", "audio"] = "video"
+    mode: Literal["video", "audio", "info", "file"] = "video"
 
 
 def valid_url(u: str) -> bool:
@@ -175,6 +184,8 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 def normalize_url(url: str) -> str:
     """Make links friendlier for the extractors: instagr.am -> instagram.com, resolve /share/ links, drop tracking params."""
     url = url.strip()
+    if is_tiktok(url):  # yt-dlp only knows /video/ links; photo posts are the same post under /photo/
+        return re.sub(r"(tiktok\.com/@[^/?#]+)/photo/", r"\1/video/", url, flags=re.I)
     if not is_instagram(url):
         return url
     p = urlparse(url)
@@ -350,6 +361,261 @@ def instagram_fallback(url: str, folder: str, mode: str) -> str:
     raise last or RuntimeError("Instagram did not return any media for this link")
 
 
+def is_tiktok(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return host == "tiktok.com" or host.endswith(".tiktok.com")
+
+
+def is_snapchat(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return host == "snapchat.com" or host.endswith(".snapchat.com")
+
+
+# Hosts that picture / video files may be fetched from (this also blocks SSRF through the "file" mode).
+MEDIA_HOSTS = ("tiktokcdn.com", "tiktokcdn-us.com", "tiktokv.com", "tiktokv.us", "byteoversea.com", "ibytedtos.com",
+               "ibyteimg.com", "muscdn.com", "tikwm.com", "cdninstagram.com", "fbcdn.net", "sc-cdn.net", "snapchat.com")
+
+
+def media_ok(u: str) -> bool:
+    try:
+        p = urlparse(u)
+    except ValueError:
+        return False
+    host = (p.hostname or "").lower()
+    return p.scheme == "https" and any(host == h or host.endswith("." + h) for h in MEDIA_HOSTS)
+
+
+class _CheckRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not media_ok(newurl):
+            raise urllib.error.URLError("redirect to a host that is not allowed")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def download_media(u: str, path: str) -> str:
+    """Download one allowed media URL to `path`; returns the Content-Type. Every redirect target is re-checked."""
+    if not media_ok(u):
+        raise RuntimeError("that file can't be fetched")
+    host = (urlparse(u).hostname or "").lower()
+    referer = ("https://www.tiktok.com/" if any(x in host for x in ("tiktok", "byte", "muscdn", "tikwm"))
+               else "https://www.snapchat.com/" if ("snap" in host or "sc-cdn" in host) else "https://www.instagram.com/")
+    handlers = [_CheckRedirect()]
+    if OUT_PROXY:
+        handlers.append(urllib.request.ProxyHandler({"http": OUT_PROXY, "https": OUT_PROXY}))
+    req = urllib.request.Request(u, headers={"User-Agent": UA, "Referer": referer, "Accept": "*/*"})
+    limit = MAX_MB * 1024 * 1024
+    got = 0
+    with urllib.request.build_opener(*handlers).open(req, timeout=45) as r, open(path, "wb") as fh:
+        ctype = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        while True:
+            chunk = r.read(1 << 16)
+            if not chunk:
+                break
+            got += len(chunk)
+            if got > limit:
+                raise RuntimeError(f"the file is larger than the {MAX_MB} MB limit")
+            fh.write(chunk)
+    if got == 0:
+        raise RuntimeError("the download was empty")
+    return ctype
+
+
+MEDIA_EXT = {"image/jpeg": ".jpg", "image/jpg": ".jpg", "image/png": ".png", "image/webp": ".webp", "image/gif": ".gif",
+             "video/mp4": ".mp4", "video/quicktime": ".mov", "video/webm": ".webm"}
+
+
+def fetch_media_file(u: str, folder: str) -> tuple[str, str]:
+    tmp = os.path.join(folder, "media.part")
+    ctype = download_media(u, tmp)
+    ext = MEDIA_EXT.get(ctype) or os.path.splitext(urlparse(u).path)[1].lower()
+    if ext not in MEDIA_EXT.values():
+        ext = ".mp4" if ctype.startswith("video/") else ".jpg"
+    if not ctype or ctype == "application/octet-stream":
+        ctype = {".jpg": "image/jpeg", ".png": "image/png", ".webp": "image/webp", ".gif": "image/gif", ".mov": "video/quicktime", ".webm": "video/webm"}.get(ext, "video/mp4")
+    path = os.path.join(folder, "media" + ext)
+    os.replace(tmp, path)
+    return path, ctype
+
+
+# ---- photo slides / mixed carousels (TikTok and Instagram) ----
+INFO_CACHE: dict[str, tuple[float, list]] = {}
+
+
+def tiktok_item(text: str):
+    """The post's data object from a TikTok page, or None when the page has none (blocked / changed)."""
+    m = re.search(r'<script[^>]+id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)</script>', text, re.S)
+    if m:
+        try:
+            d = json.loads(m.group(1))
+            it = ((((d.get("__DEFAULT_SCOPE__") or {}).get("webapp.video-detail") or {}).get("itemInfo") or {}).get("itemStruct"))
+            if isinstance(it, dict):
+                return it
+        except (ValueError, AttributeError):
+            pass
+    m = re.search(r'<script[^>]+id="SIGI_STATE"[^>]*>(.*?)</script>', text, re.S)
+    if m:
+        try:
+            mod = json.loads(m.group(1)).get("ItemModule") or {}
+            for it in mod.values():
+                if isinstance(it, dict):
+                    return it
+        except (ValueError, AttributeError):
+            pass
+    return None
+
+
+def tiktok_items_from(item: dict) -> list[dict]:
+    imgs = ((item.get("imagePost") or {}).get("images")) or []
+    out = []
+    for im in imgs:
+        urls = [u for u in (((im or {}).get("imageURL") or {}).get("urlList") or []) if isinstance(u, str) and media_ok(u)]
+        if urls:
+            out.append({"kind": "image", "src": next((u for u in urls if re.search(r"\.jpe?g(\?|$)", u)), urls[0])})
+    vid = item.get("video") or {}
+    if out and (vid.get("duration") or 0) > 0 and (vid.get("playAddr") or vid.get("downloadAddr")):
+        out.append({"kind": "video", "via": "page"})  # the post also carries a real video: fetched with the normal video route
+    return out
+
+
+def tikwm_items(url: str) -> list[dict]:
+    """Second opinion used only when TikTok's own page can't be read from this server."""
+    req = urllib.request.Request("https://www.tikwm.com/api/?hd=1&url=" + quote(url, safe=""), headers={"User-Agent": UA})
+    with open_url(req, 20) as r:
+        data = json.loads(r.read(2_000_000).decode("utf-8", "replace"))
+    d = data.get("data") if isinstance(data, dict) and data.get("code") == 0 else None
+    return [{"kind": "image", "src": u} for u in ((d or {}).get("images") or []) if isinstance(u, str) and media_ok(u)]
+
+
+def tiktok_items(url: str) -> list[dict]:
+    text = page_text(url)
+    item = tiktok_item(text) if text else None
+    if item is not None:
+        return tiktok_items_from(item)
+    return tikwm_items(url)
+
+
+def _cookie_copy() -> str | None:
+    if not COOKIES:
+        return None
+    fd, path = tempfile.mkstemp(prefix="ck_", suffix=".txt")
+    with os.fdopen(fd, "w") as fh:
+        fh.write(COOKIES)
+    try:
+        yt_dlp.cookies.YoutubeDLCookieJar(path).load(ignore_discard=True, ignore_expires=True)
+        return path
+    except Exception:
+        os.remove(path)
+        return None
+
+
+def instagram_items(url: str) -> list[dict]:
+    items: list[dict] = []
+    opts = {"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": False, "socket_timeout": 15,
+            "retries": 1, "format": "b/best", "ignoreerrors": True}
+    if OUT_PROXY:
+        opts["proxy"] = OUT_PROXY
+    ck = _cookie_copy()
+    if ck:
+        opts["cookiefile"] = ck
+    try:
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+            entries = list(info.get("entries") or [info]) if info else []
+            for e in entries:
+                u = (e or {}).get("url")
+                if not u or not media_ok(u):
+                    continue
+                is_img = (e.get("ext") or "").lower() in ("jpg", "jpeg", "png", "webp") or urlparse(u).path.lower().endswith(IMAGE_EXT)
+                items.append({"kind": "image" if is_img else "video", "src": u})
+        except Exception as e:
+            print(f"[toolora] instagram info (yt-dlp) failed: {ANSI.sub('', str(e))[:300]}", flush=True)
+    finally:
+        if ck:
+            try:
+                os.remove(ck)
+            except OSError:
+                pass
+    if not items:  # public embed page: only trusted when it shows pictures only (video posts stay on the normal route)
+        m = re.search(r"instagram\.com/(?:[^/?#]+/)?(?:p|reels?|tv)/([A-Za-z0-9_-]+)", url)
+        text = page_text(f"https://www.instagram.com/p/{m.group(1)}/embed/captioned/") if m else ""
+        if text:
+            v, i = ig_media_urls(text)
+            if not [x for x in v if cdn_ok(x)]:
+                seen = set()
+                for x in i:
+                    key = urlparse(x).path
+                    if cdn_ok(x) and key not in seen:
+                        seen.add(key)
+                        items.append({"kind": "image", "src": x})
+    return items
+
+
+def info_items(url: str) -> list[dict]:
+    key = url.strip()
+    hit = INFO_CACHE.get(key)
+    if hit and time.time() - hit[0] < 300:
+        return hit[1]
+    url = normalize_url(key)
+    try:
+        items = instagram_items(url) if is_instagram(url) else tiktok_items(url)
+    except Exception as e:
+        print(f"[toolora] slides info failed {key[:120]}: {ANSI.sub('', str(e))[:300]}", flush=True)
+        items = []
+    if items:
+        if len(INFO_CACHE) > 200:
+            INFO_CACHE.clear()
+        INFO_CACHE[key] = (time.time(), items)
+    return items
+
+
+# ---- Snapchat Spotlight (no watermark: the public page serves the original video) ----
+def snap_resolve(url: str) -> str:
+    """snapchat.com/t/XXXX short links redirect to the real /spotlight/... page."""
+    if not urlparse(url).path.startswith("/t/"):
+        return url
+    try:
+        from curl_cffi import requests as cr
+        kw = {"proxies": {"http": OUT_PROXY, "https": OUT_PROXY}} if OUT_PROXY else {}
+        r = cr.get(url, headers={"Accept-Language": "en-US,en;q=0.9"}, impersonate="chrome", timeout=20, allow_redirects=True, **kw)
+        final = str(r.url)
+    except Exception:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": UA})
+            with open_url(req, 20) as r:
+                final = r.geturl()
+        except Exception:
+            return url
+    return final if is_snapchat(final) else url
+
+
+def snap_video_urls(page: str) -> list[str]:
+    t = re.sub(r"\\+u002[Ff]", "/", _unesc(page))  # Next.js pages write "/" as \u002F
+    found = re.findall(r'<meta[^>]+property=["\']og:video(?::secure_url|:url)?["\'][^>]+content=["\'](https?://[^"\']+)', t)
+    found += re.findall(r'<meta[^>]+content=["\'](https?://[^"\']+)["\'][^>]+property=["\']og:video', t)
+    found += re.findall(r'"contentUrl"\s*:\s*"(https?://[^"]+)"', t)
+    found += [x for x in re.findall(r'(https?://[A-Za-z0-9.-]*sc-cdn\.net/[^"\'\s<>\\]+)', t) if ".mp4" in urlparse(x).path.lower()]
+    return [x for x in _uniq(found) if media_ok(x)]
+
+
+def snapchat_fallback(url: str, folder: str, mode: str) -> str:
+    text = page_text(url)
+    if not text:
+        raise RuntimeError("Snapchat didn't return the page for this link")
+    last = None
+    for u in snap_video_urls(text):
+        path = os.path.join(folder, "snapchat_spotlight.mp4")
+        try:
+            ctype = download_media(u, path)
+            if ctype.startswith("image/"):
+                os.remove(path)
+                continue
+            return to_mp3(path, folder, "snapchat_spotlight") if mode == "audio" else path
+        except Exception as e:
+            last = e
+    raise last or RuntimeError("couldn't find a video on that Snapchat page. Use a public Spotlight link.")
+
+
 def attempts_for(mode: str, url: str) -> list[dict]:
     if mode == "audio":
         formats = [{
@@ -406,6 +672,8 @@ def pick_file(folder: str, mode: str) -> str | None:
 
 def fetch(url: str, folder: str, mode: str = "video") -> str:
     url = normalize_url(url)
+    if is_snapchat(url):
+        url = snap_resolve(url)
     base = {
         "outtmpl": os.path.join(folder, "%(title).80B [%(id)s].%(ext)s"),
         "merge_output_format": "mp4",
@@ -419,7 +687,9 @@ def fetch(url: str, folder: str, mode: str = "video") -> str:
         "fragment_retries": 3,
         "remote_components": ["ejs:github"],
     }
-    if OUT_PROXY:
+    if is_youtube(url) and YT_PROXY:
+        base["proxy"] = YT_PROXY
+    elif OUT_PROXY:
         base["proxy"] = OUT_PROXY
     if is_youtube(url):
         base.update({"retries": 1, "fragment_retries": 2, "socket_timeout": 15})
@@ -434,6 +704,7 @@ def fetch(url: str, folder: str, mode: str = "video") -> str:
         except Exception:  # unusable cookies must never block downloads
             pass
     insta = is_instagram(url)
+    snap = is_snapchat(url)
     last = None
     try:
         capped = False  # a download that finished without a file means the size cap was hit
@@ -453,7 +724,7 @@ def fetch(url: str, folder: str, mode: str = "video") -> str:
                     ydl.download([url])
             except Exception as e:
                 last = e
-                if insta:  # Instagram is flaky from servers: always try the next strategy
+                if insta or snap:  # Instagram is flaky from servers: always try the next strategy
                     continue
                 if not isinstance(e, yt_dlp.utils.DownloadError):
                     raise
@@ -477,6 +748,13 @@ def fetch(url: str, folder: str, mode: str = "video") -> str:
             clear_folder(folder)
             try:
                 return instagram_fallback(url, folder, mode)
+            except Exception as e:
+                if last is None:
+                    last = e
+        if snap:
+            clear_folder(folder)
+            try:
+                return snapchat_fallback(url, folder, mode)
             except Exception as e:
                 if last is None:
                     last = e
@@ -504,17 +782,48 @@ async def download(req: Req, request: Request):
         ip = request.headers.get("x-client-ip") or "?"  # the real visitor, as seen by the worker
     else:
         ip = request.headers.get("cf-connecting-ip") or (request.client.host if request.client else "?")
-    check_rate(ip)
-    if not valid_url(req.url):
-        raise HTTPException(400, "Paste a link from YouTube, TikTok, Instagram or X (Twitter).")
+    if req.mode in ("info", "file"):
+        check_rate(ip, fhits, RATE * 12)
+    else:
+        check_rate(ip)
+    link = req.url.strip()
+
+    if req.mode == "file":  # one picture / video of a slide post, by its direct media link
+        if not media_ok(link):
+            raise HTTPException(400, "That file can't be fetched.")
+        folder = tempfile.mkdtemp(prefix="dl_")
+        cleanup = BackgroundTask(shutil.rmtree, folder, ignore_errors=True)
+        try:
+            async with file_slots:
+                path, ctype = await asyncio.to_thread(fetch_media_file, link, folder)
+        except Exception as e:
+            shutil.rmtree(folder, ignore_errors=True)
+            print(f"[toolora] file fetch failed {link[:120]}: {ANSI.sub('', str(e))[:300]}", flush=True)
+            raise HTTPException(422, f"Couldn't fetch that file: {clean_error(e)}")
+        return FileResponse(path, media_type=ctype, filename=os.path.basename(path), background=cleanup)
+
+    if not valid_url(link):
+        raise HTTPException(400, "Paste a link from YouTube, TikTok, Instagram, X (Twitter) or Snapchat.")
+
+    if req.mode == "info":  # never an error: an empty list simply means "use the normal single-video download"
+        items: list = []
+        if is_instagram(link) or is_tiktok(link):
+            try:
+                async with slots:
+                    items = await asyncio.wait_for(asyncio.to_thread(info_items, link), 45)
+            except Exception as e:
+                print(f"[toolora] slides info failed {link[:120]}: {ANSI.sub('', str(e))[:300]}", flush=True)
+                items = []
+        return JSONResponse({"items": items}, headers={"Cache-Control": "no-store"})
+
     folder = tempfile.mkdtemp(prefix="dl_")
     cleanup = BackgroundTask(shutil.rmtree, folder, ignore_errors=True)
     try:
         async with slots:
-            path = await asyncio.to_thread(fetch, req.url.strip(), folder, req.mode)
+            path = await asyncio.to_thread(fetch, link, folder, req.mode)
     except Exception as e:
         shutil.rmtree(folder, ignore_errors=True)
-        print(f"[toolora] download failed ({req.mode}) {req.url.strip()[:120]}: {ANSI.sub('', str(e))[:600]}", flush=True)
+        print(f"[toolora] download failed ({req.mode}) {link[:120]}: {ANSI.sub('', str(e))[:600]}", flush=True)
         reason = clean_error(e)
         what = "extract the audio from" if req.mode == "audio" else "download"
         raise HTTPException(422, f"Couldn't {what} that video: {reason}")
