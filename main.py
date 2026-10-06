@@ -185,7 +185,7 @@ def normalize_url(url: str) -> str:
     """Make links friendlier for the extractors: instagr.am -> instagram.com, resolve /share/ links, drop tracking params."""
     url = url.strip()
     if is_tiktok(url):  # yt-dlp only knows /video/ links; photo posts are the same post under /photo/
-        return re.sub(r"(tiktok\.com/@[^/?#]+)/photo/", r"\1/video/", url, flags=re.I)
+        return re.sub(r"(tiktok\.com/@[^/?#]+)/photo/", r"\1/video/", tiktok_resolve(url), flags=re.I)
     if not is_instagram(url):
         return url
     p = urlparse(url)
@@ -487,18 +487,93 @@ def tikwm_items(url: str) -> list[dict]:
     return [{"kind": "image", "src": u} for u in ((d or {}).get("images") or []) if isinstance(u, str) and media_ok(u)]
 
 
+TT_RESOLVED: dict[str, str] = {}
+
+
+def tiktok_resolve(url: str) -> str:
+    """Short share links (tiktok.com/t/..., vm./vt.tiktok.com) -> the real https://www.tiktok.com/@user/(video|photo)/<id> link."""
+    url = url.strip()
+    p = urlparse(url)
+    host = (p.hostname or "").lower()
+    if re.search(r"/@[^/?#]+/(?:video|photo)/\d+", p.path or ""):
+        return url
+    if not (host.startswith(("vm.", "vt.")) or (p.path or "").startswith("/t/")):
+        return url
+    if url in TT_RESOLVED:
+        return TT_RESOLVED[url]
+    final = url
+    for _ in range(5):  # follow the redirects ourselves so the Location header is always seen
+        try:
+            handlers = [_NoRedirect]
+            if OUT_PROXY:
+                handlers.append(urllib.request.ProxyHandler({"http": OUT_PROXY, "https": OUT_PROXY}))
+            urllib.request.build_opener(*handlers).open(
+                urllib.request.Request(final, headers={"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"}), timeout=15).close()
+            break
+        except urllib.error.HTTPError as e:
+            loc = e.headers.get("Location") if e.headers else None
+            if e.code not in (301, 302, 303, 307, 308) or not loc:
+                break
+            final = urljoin(final, loc)
+            if re.search(r"/@[^/?#]+/(?:video|photo)/\d+", urlparse(final).path or ""):
+                break
+        except Exception:
+            break
+    m = re.search(r"/(@[^/?#]+)/(video|photo)/(\d+)", urlparse(final).path or "")
+    if not m:
+        return url
+    out = f"https://www.tiktok.com/{m.group(1)}/{m.group(2)}/{m.group(3)}"
+    if len(TT_RESOLVED) > 500:
+        TT_RESOLVED.clear()
+    TT_RESOLVED[url] = out
+    return out
+
+
+def tiktok_ytdlp_item(url: str):
+    """The post's data object read through yt-dlp's TikTok extractor (works when the plain page is blocked)."""
+    m = re.search(r"/@[^/?#]+/(?:video|photo)/(\d+)", url)
+    if not m:
+        return None
+    opts = {"quiet": True, "no_warnings": True, "socket_timeout": 15}
+    if OUT_PROXY:
+        opts["proxy"] = OUT_PROXY
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        ie = ydl.get_info_extractor("TikTok")
+        data, _ = ie._extract_web_data_and_status(re.sub(r"/photo/", "/video/", url), m.group(1))
+    return data if isinstance(data, dict) else None
+
+
 def tiktok_items(url: str) -> list[dict]:
-    text = page_text(url)
-    item = tiktok_item(text) if text else None
-    if item is not None:
-        out = tiktok_items_from(item)
-        if out or not (item.get("imagePost") or "/photo/" in url.lower()):
-            return out  # a normal video post: empty list = use the normal video route
-    try:  # page blocked / changed, or a photo post whose pictures weren't readable: ask the second source
-        return tikwm_items(url)
+    url = tiktok_resolve(url)
+    is_photo = "/photo/" in url.lower()
+    pages = [url]
+    if is_photo:  # TikTok often leaves the post data out of the /photo/ page; the /video/ page of the same post has it
+        pages.append(re.sub(r"/photo/", "/video/", url))
+    for pu in pages:
+        text = page_text(pu)
+        item = tiktok_item(text) if text else None
+        if item is not None:
+            out = tiktok_items_from(item)
+            if out or not (item.get("imagePost") or is_photo):
+                return out  # a normal video post: empty list = use the normal video route
+    try:  # third source: yt-dlp's TikTok reader
+        item = tiktok_ytdlp_item(url)
+        if item is not None:
+            out = tiktok_items_from(item)
+            if out or not (item.get("imagePost") or is_photo):
+                return out
     except Exception as e:
-        print(f"[toolora] tikwm failed {url[:120]}: {ANSI.sub('', str(e))[:200]}", flush=True)
-        return []
+        print(f"[toolora] tiktok yt-dlp info failed {url[:120]}: {ANSI.sub('', str(e))[:200]}", flush=True)
+    for i in range(2):  # last source: tikwm (free tier allows about 1 request per second, so retry once)
+        try:
+            out = tikwm_items(url)
+            if out:
+                return out
+        except Exception as e:
+            print(f"[toolora] tikwm failed {url[:120]}: {ANSI.sub('', str(e))[:200]}", flush=True)
+        if i == 0:
+            time.sleep(1.5)
+    return []
 
 
 def _cookie_copy() -> str | None:
