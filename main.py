@@ -46,7 +46,7 @@ slots = asyncio.Semaphore(int(os.getenv("MAX_CONCURRENT", "3")))
 file_slots = asyncio.Semaphore(4)  # picture / slide file transfers (light, so they do not wait behind video downloads)
 
 # Only these sites (and their subdomains) are accepted; this also blocks SSRF to internal hosts.
-ALLOWED_HOSTS = ("youtube.com", "youtu.be", "tiktok.com", "instagram.com", "instagr.am", "twitter.com", "x.com", "snapchat.com")
+ALLOWED_HOSTS = ("youtube.com", "youtu.be", "tiktok.com", "instagram.com", "instagr.am", "twitter.com", "x.com", "snapchat.com", "pinterest.com", "pin.it")
 
 app = FastAPI(title="Toolora backend")
 app.add_middleware(
@@ -90,7 +90,8 @@ def valid_url(u: str) -> bool:
     except ValueError:
         return False
     host = (p.hostname or "").lower()
-    return p.scheme in ("http", "https") and any(host == h or host.endswith("." + h) for h in ALLOWED_HOSTS)
+    pinterest_host = bool(re.fullmatch(r"(?:[a-z0-9-]+\.)*pinterest\.(?:com|[a-z]{2,3}|co\.[a-z]{2}|com\.[a-z]{2})", host))
+    return p.scheme in ("http", "https") and (pinterest_host or any(host == h or host.endswith("." + h) for h in ALLOWED_HOSTS))
 
 
 SORT = ["res", "ext:mp4:m4a"]  # best resolution, preferring MP4/M4A so the result plays on phones
@@ -120,6 +121,11 @@ def is_youtube(url: str) -> bool:
 IMAGE_EXT = (".jpg", ".jpeg", ".png", ".webp")
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 IG_CDN = ("cdninstagram.com", "fbcdn.net")  # the only hosts the fallback downloader will pull media from
+
+
+def is_pinterest(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return bool(re.fullmatch(r"(?:[a-z0-9-]+\.)*pinterest\.(?:com|[a-z]{2,3}|co\.[a-z]{2}|com\.[a-z]{2})", host) or host == "pin.it" or host.endswith(".pin.it"))
 
 
 def is_instagram(url: str) -> bool:
@@ -372,7 +378,7 @@ def is_snapchat(url: str) -> bool:
 
 
 # Hosts that picture / video files may be fetched from (this also blocks SSRF through the "file" mode).
-MEDIA_HOSTS = ("tiktokcdn.com", "tiktokcdn-us.com", "tiktokcdn-eu.com", "tiktokv.com", "tiktokv.us", "byteoversea.com", "ibytedtos.com",
+MEDIA_HOSTS = ("pinimg.com", "tiktokcdn.com", "tiktokcdn-us.com", "tiktokcdn-eu.com", "tiktokv.com", "tiktokv.us", "byteoversea.com", "ibytedtos.com",
                "ibyteimg.com", "muscdn.com", "tikwm.com", "cdninstagram.com", "fbcdn.net", "sc-cdn.net", "snapchat.com")
 
 
@@ -397,7 +403,8 @@ def download_media(u: str, path: str) -> str:
     if not media_ok(u):
         raise RuntimeError("that file can't be fetched")
     host = (urlparse(u).hostname or "").lower()
-    referer = ("https://www.tiktok.com/" if any(x in host for x in ("tiktok", "byte", "muscdn", "tikwm"))
+    referer = ("https://www.pinterest.com/" if "pinimg.com" in host
+               else "https://www.tiktok.com/" if any(x in host for x in ("tiktok", "byte", "muscdn", "tikwm"))
                else "https://www.snapchat.com/" if ("snap" in host or "sc-cdn" in host) else "https://www.instagram.com/")
     handlers = [_CheckRedirect()]
     if OUT_PROXY:
@@ -798,6 +805,54 @@ def pick_file(folder: str, mode: str) -> str | None:
     return os.path.join(folder, max(files, key=lambda f: os.path.getsize(os.path.join(folder, f))))
 
 
+def pinterest_fallback(url: str, folder: str) -> str:
+    """Fetch a public Pinterest Pin's direct video or image when yt-dlp cannot extract it."""
+    page = re.sub(r"\\+u002[Ff]", "/", _unesc(page_text(url)))
+    if not page:
+        raise RuntimeError("Pinterest did not return the Pin page. It may be private or temporarily unavailable.")
+
+    candidates = []
+    # Explicit media metadata first; support either attribute order.
+    for prop in ("og:video:secure_url", "og:video", "og:video:url", "twitter:player:stream", "og:image:secure_url", "og:image", "twitter:image"):
+        patterns = (
+            rf'<meta[^>]+property=["\']{re.escape(prop)}["\'][^>]+content=["\']([^"\']+)',
+            rf'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']{re.escape(prop)}["\']',
+            rf'<meta[^>]+name=["\']{re.escape(prop)}["\'][^>]+content=["\']([^"\']+)',
+            rf'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']{re.escape(prop)}["\']',
+        )
+        for pattern in patterns:
+            candidates.extend(re.findall(pattern, page, re.I))
+    # Pinterest often embeds direct CDN media URLs in serialized page data.
+    candidates.extend(re.findall(r'https?:\\?/\\?/[^"\'\s<>]+(?:pinimg\.com|pinterest\.com)[^"\'\s<>]*', page, re.I))
+    candidates = [x.replace(r'\/', '/').replace(r'\u0026', '&').rstrip('),;') for x in candidates]
+    candidates = _uniq([urljoin(url, html.unescape(x)) for x in candidates])
+
+    # Prefer video streams when present, but allow a normal photo Pin as the primary result.
+    ordered = [x for x in candidates if re.search(r'\.(?:mp4|m3u8)(?:[?#]|$)|/videos?/', urlparse(x).path, re.I)]
+    ordered += [x for x in candidates if x not in ordered and "pinimg.com" in (urlparse(x).hostname or "").lower()]
+    last = None
+    for media_url in ordered:
+        if not media_ok(media_url):
+            continue
+        try:
+            path = os.path.join(folder, "pinterest_media")
+            ctype = download_media(media_url, path)
+            ext = MEDIA_EXT.get(ctype) or os.path.splitext(urlparse(media_url).path)[1].lower()
+            if ext not in MEDIA_EXT.values():
+                ext = ".mp4" if ctype.startswith("video/") else ".jpg" if ctype.startswith("image/") else ""
+            media_type_ok = ctype.startswith("image/") or ctype.startswith("video/")
+            if not ext or (not media_type_ok and ctype != "application/octet-stream"):
+                raise RuntimeError("Pinterest did not return a supported image or video file.")
+            if ctype == "application/octet-stream" and ext not in (".jpg", ".jpeg", ".png", ".webp", ".gif", ".mp4", ".mov", ".webm"):
+                raise RuntimeError("Pinterest returned an unsupported media format.")
+            final_path = os.path.join(folder, "pinterest_download" + ext)
+            os.replace(path, final_path)
+            return final_path
+        except Exception as e:
+            last = e
+    raise last or RuntimeError("Pinterest did not expose a downloadable image or video for this Pin. The Pin may be private, restricted, or temporarily blocked.")
+
+
 def fetch(url: str, folder: str, mode: str = "video") -> str:
     orig = url.strip()
     url = normalize_url(url)
@@ -859,7 +914,7 @@ def fetch(url: str, folder: str, mode: str = "video") -> str:
                     ydl.download([url])
             except Exception as e:
                 last = e
-                if insta or snap:  # Instagram is flaky from servers: always try the next strategy
+                if insta or snap or is_pinterest(url):  # these platforms can fail one extractor while another strategy still works
                     continue
                 if is_tiktok(url) and mode == "video" and isinstance(e, yt_dlp.utils.DownloadError):
                     break  # e.g. a photo post yt-dlp can't read: go straight to the picture fallback below
@@ -901,6 +956,13 @@ def fetch(url: str, folder: str, mode: str = "video") -> str:
             clear_folder(folder)
             try:
                 return snapchat_fallback(url, folder, mode)
+            except Exception as e:
+                if last is None:
+                    last = e
+        if is_pinterest(url):
+            clear_folder(folder)
+            try:
+                return pinterest_fallback(orig, folder)
             except Exception as e:
                 if last is None:
                     last = e
@@ -949,7 +1011,7 @@ async def download(req: Req, request: Request):
         return FileResponse(path, media_type=ctype, filename=os.path.basename(path), background=cleanup)
 
     if not valid_url(link):
-        raise HTTPException(400, "Paste a link from YouTube, TikTok, Instagram, X (Twitter) or Snapchat.")
+        raise HTTPException(400, "Paste a link from YouTube, TikTok, Instagram, X (Twitter), Snapchat or Pinterest.")
 
     if req.mode == "info":  # never an error: an empty list simply means "use the normal single-video download"
         items: list = []
@@ -972,7 +1034,8 @@ async def download(req: Req, request: Request):
         print(f"[toolora] download failed ({req.mode}) {link[:120]}: {ANSI.sub('', str(e))[:600]}", flush=True)
         reason = clean_error(e)
         what = "extract the audio from" if req.mode == "audio" else "download"
-        raise HTTPException(422, f"Couldn't {what} that video: {reason}")
+        target = "that media" if is_pinterest(link) else "that video"
+        raise HTTPException(422, f"Couldn't {what} {target}: {reason}")
     ext = os.path.splitext(path)[1].lower()
     media = {".mp3": "audio/mpeg", ".mp4": "video/mp4", ".webm": "video/webm", ".mkv": "video/x-matroska", ".mov": "video/quicktime", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp"}.get(ext, "application/octet-stream")
     return FileResponse(path, media_type=media, filename=os.path.basename(path), background=cleanup)
