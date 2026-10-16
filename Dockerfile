@@ -29,13 +29,6 @@ RUN pip install --no-cache-dir -U --pre --no-deps yt-dlp \
     && pip install --no-cache-dir "yt-dlp[default,curl-cffi]" fastapi "uvicorn[standard]" \
     && python -c "import yt_dlp, yt_dlp_ejs, curl_cffi; print('yt-dlp', yt_dlp.version.__version__, '| ejs', yt_dlp_ejs.version, '| curl_cffi', curl_cffi.__version__)"
 
-# YouTube "confirm you're not a bot" workaround: a local PO-token helper (bgutil-pot, port 4416) plus its yt-dlp plugin.
-# yt-dlp picks it up automatically and sends YouTube the proof-of-origin tokens a real browser sends.
-ADD https://github.com/jim60105/bgutil-ytdlp-pot-provider-rs/releases/download/v0.8.1/bgutil-pot-linux-x86_64 /usr/local/bin/bgutil-pot
-ADD https://github.com/jim60105/bgutil-ytdlp-pot-provider-rs/releases/download/v0.8.1/bgutil-ytdlp-pot-provider-rs.zip /etc/yt-dlp/plugins/bgutil-ytdlp-pot-provider-rs.zip
-RUN chmod +x /usr/local/bin/bgutil-pot && (bgutil-pot --version || true)
-
 COPY main.py .
 
-# The token helper runs in the background; if it ever fails, downloads still work as before.
-CMD ["sh", "-c", "(bgutil-pot server --host 127.0.0.1 --port 4416 >/tmp/bgutil.log 2>&1 &) ; exec uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]
