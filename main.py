@@ -243,6 +243,10 @@ def clean_error(e: BaseException) -> str:
     if "sign in to confirm" in low and "bot" in low:
         msg = ("YouTube is refusing this server's connection right now (it asked to confirm the visitor is not a bot). "
                "Please try again in a few minutes.")
+    elif "this content isn't available to everyone" in low or "this content is not available to everyone" in low:
+        msg = ("Instagram restricts this post to certain audiences. If the post is visible in your own Instagram account, "
+               "configure a valid COOKIES_TXT value on the backend using cookies from an account authorized to view it, "
+               "then redeploy. If that account cannot view the post, Toolora cannot download it.")
     return msg[:360]
 
 
@@ -346,8 +350,6 @@ def instagram_fallback(url: str, folder: str, mode: str) -> str:
         if vids:
             break
     stem = f"instagram_{code}"
-    # Reels/TV links are unambiguously video. For /p/ posts, the video URLs extracted above take priority.
-    explicit_video_url = bool(re.search(r"instagram\.com/(?:[^/?#]+/)?(?:reels?|tv)/", url, re.I))
     last = None
     for u in _uniq(vids):
         path = os.path.join(folder, stem + ".mp4")
@@ -358,8 +360,6 @@ def instagram_fallback(url: str, folder: str, mode: str) -> str:
             last = e
     if mode == "audio":
         raise last or RuntimeError("this post has no audio track")
-    if explicit_video_url:
-        raise last or RuntimeError("Instagram identified this as a video, but did not provide a downloadable video stream. Please try again later or check that the post is public.")
     for u in _uniq(imgs):
         ext = os.path.splitext(urlparse(u).path)[1].lower()
         path = os.path.join(folder, stem + (ext if ext in IMAGE_EXT else ".jpg"))
@@ -620,9 +620,6 @@ def instagram_items(url: str) -> list[dict]:
                 if not u or not media_ok(u):
                     continue
                 is_img = (e.get("ext") or "").lower() in ("jpg", "jpeg", "png", "webp") or urlparse(u).path.lower().endswith(IMAGE_EXT)
-                # Reel/TV pages are video posts; a thumbnail URL is not a downloadable media item.
-                if is_img and re.search(r"instagram\.com/(?:[^/?#]+/)?(?:reels?|tv)/", url, re.I):
-                    continue
                 items.append({"kind": "image" if is_img else "video", "src": u})
         except Exception as e:
             print(f"[toolora] instagram info (yt-dlp) failed: {ANSI.sub('', str(e))[:300]}", flush=True)
@@ -941,11 +938,6 @@ def fetch(url: str, folder: str, mode: str = "video") -> str:
                 continue
             path = pick_file(folder, mode)
             if path:
-                # Instagram occasionally exposes a video's poster frame as a JPG. Do not
-                # report that as a successful video download; continue to the direct-media fallback.
-                if insta and mode == "video" and os.path.splitext(path)[1].lower() in IMAGE_EXT:
-                    last = RuntimeError("Instagram returned a preview image instead of the post's video stream.")
-                    continue
                 return path
             capped = True
         if insta:
