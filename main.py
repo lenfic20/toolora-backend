@@ -243,10 +243,6 @@ def clean_error(e: BaseException) -> str:
     if "sign in to confirm" in low and "bot" in low:
         msg = ("YouTube is refusing this server's connection right now (it asked to confirm the visitor is not a bot). "
                "Please try again in a few minutes.")
-    elif "this content isn't available to everyone" in low or "this content is not available to everyone" in low:
-        msg = ("Instagram restricts this post to certain audiences. If the post is visible in your own Instagram account, "
-               "configure a valid COOKIES_TXT value on the backend using cookies from an account authorized to view it, "
-               "then redeploy. If that account cannot view the post, Toolora cannot download it.")
     return msg[:360]
 
 
@@ -277,6 +273,25 @@ def ig_media_urls(page: str):
     imgs += re.findall(r'class=["\'][^"\']*EmbeddedMediaImage[^"\']*["\'][^>]+src=["\'](https?://[^"\']+)', t)
     imgs += re.findall(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\'](https?://[^"\']+)', t)
     return _uniq(vids), _uniq(imgs)
+
+
+def ig_is_video(page: str, url: str = "") -> bool:
+    """True when an Instagram post is a video: reels and IGTV links always are, otherwise the page data says so.
+    Several-item posts (carousels) are left out on purpose: they can mix pictures and videos."""
+    km = re.search(r"instagram\.com/(?:[^/?#]+/)?(p|reels?|tv)/", url or "", re.I)
+    if km and km.group(1).lower() != "p":
+        return True
+    t = _unesc(page or "")
+    if re.search(r"edge_sidecar_to_children|GraphSidecar|carousel_media", t):
+        return False
+    return bool(re.search(
+        r'is_video\\*"\s*:\s*true'
+        r'|__typename\\*"\s*:\s*\\*"GraphVideo'
+        r'|media_type\\*"\s*:\s*2\b'
+        r'|product_type\\*"\s*:\s*\\*"clips'
+        r'|video_url\\*"\s*:\s*\\*"https?:'
+        r'|<meta[^>]+property=["\']og:video',
+        t, re.I))
 
 
 def cdn_ok(u: str) -> bool:
@@ -337,6 +352,7 @@ def instagram_fallback(url: str, folder: str, mode: str) -> str:
     if not m:
         raise RuntimeError("not a post, reel or video link")
     code = m.group(1)
+    is_vid = ig_is_video("", url)  # reel / IGTV links are always videos
     vids, imgs = [], []
     for page in (f"https://www.instagram.com/p/{code}/embed/captioned/",
                  f"https://www.instagram.com/reel/{code}/embed/captioned/",
@@ -345,6 +361,7 @@ def instagram_fallback(url: str, folder: str, mode: str) -> str:
         if not text:
             continue
         v, i = ig_media_urls(text)
+        is_vid = is_vid or ig_is_video(text, url)
         vids += [x for x in v if cdn_ok(x)]
         imgs += [x for x in i if cdn_ok(x)]
         if vids:
@@ -360,6 +377,9 @@ def instagram_fallback(url: str, folder: str, mode: str) -> str:
             last = e
     if mode == "audio":
         raise last or RuntimeError("this post has no audio track")
+    if is_vid:  # a video must never be answered with its cover picture
+        raise last or RuntimeError("Instagram did not let the server read this video. The post may be private or "
+                                   "restricted, or Instagram is temporarily blocking the server. Please try again in a moment.")
     for u in _uniq(imgs):
         ext = os.path.splitext(urlparse(u).path)[1].lower()
         path = os.path.join(folder, stem + (ext if ext in IMAGE_EXT else ".jpg"))
@@ -634,7 +654,7 @@ def instagram_items(url: str) -> list[dict]:
         text = page_text(f"https://www.instagram.com/p/{m.group(1)}/embed/captioned/") if m else ""
         if text:
             v, i = ig_media_urls(text)
-            if not [x for x in v if cdn_ok(x)]:
+            if not [x for x in v if cdn_ok(x)] and not ig_is_video(text, url):
                 seen = set()
                 for x in i:
                     key = urlparse(x).path
