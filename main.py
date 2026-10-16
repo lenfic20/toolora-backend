@@ -241,8 +241,7 @@ def clean_error(e: BaseException) -> str:
                "or the site is temporarily blocking the server. Please try again in a moment.")
     low = msg.lower()
     if "sign in to confirm" in low and "bot" in low:
-        msg = ("YouTube is refusing this server's connection right now (it asked to confirm the visitor is not a bot). "
-               "Please try again in a few minutes.")
+        msg = ("YouTube is busy checking this server right now. Please tap Start again in a minute.")
     return msg[:360]
 
 
@@ -269,10 +268,89 @@ def ig_media_urls(page: str):
     vids = re.findall(r'video_url\\*"\s*:\s*\\*"(https?://[^"\\\s]+)', t)
     vids += re.findall(r'<meta[^>]+property=["\']og:video(?::secure_url|:url)?["\'][^>]+content=["\'](https?://[^"\']+)', t)
     vids += re.findall(r'<video[^>]+src=["\'](https?://[^"\']+)', t)
+    for block in re.findall(r'"video_versions"\s*:\s*\[(.*?)\]', t, re.S):
+        vids += re.findall(r'"url"\s*:\s*"(https?://[^"\\\s]+)', block)[:1]
     imgs = re.findall(r'display_url\\*"\s*:\s*\\*"(https?://[^"\\\s]+)', t)
     imgs += re.findall(r'class=["\'][^"\']*EmbeddedMediaImage[^"\']*["\'][^>]+src=["\'](https?://[^"\']+)', t)
     imgs += re.findall(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\'](https?://[^"\']+)', t)
     return _uniq(vids), _uniq(imgs)
+
+
+IG_APP_ID = "936619743392459"
+IG_DOC_ID = "8845758582119845"
+IG_VIDEO_HINT = re.compile(r'"is_video"\s*:\s*true|"__typename"\s*:\s*"(?:XDT)?GraphVideo"|"media_type"\s*:\s*2\b|"product_type"\s*:\s*"(?:clips|igtv)"'
+                           r'|property=["\']og:video|EmbeddedMediaVideo|"video_versions"\s*:\s*\[\s*\{', re.I)
+
+
+def ig_code(url: str) -> str | None:
+    m = re.search(r"instagram\.com/(?:[^/?#]+/)?(?:p|reels?|tv)/([A-Za-z0-9_-]+)", url)
+    return m.group(1) if m else None
+
+
+def ig_url_is_video(url: str) -> bool:
+    """Reel / IGTV links are always videos."""
+    return bool(re.search(r"instagram\.com/(?:[^/?#]+/)?(?:reels?|tv)/", url, re.I))
+
+
+def _ig_node_items(node: dict) -> list[dict]:
+    kids = [((e or {}).get("node") or {}) for e in (((node.get("edge_sidecar_to_children") or {}).get("edges")) or [])]
+    out = []
+    for n in (kids or [node]):
+        if n.get("is_video") and n.get("video_url"):
+            out.append({"kind": "video", "src": n["video_url"]})
+        elif n.get("display_url") and not n.get("is_video"):
+            out.append({"kind": "image", "src": n["display_url"]})
+    return [x for x in out if cdn_ok(x["src"])]
+
+
+def ig_graphql(code: str) -> tuple[list[dict], bool]:
+    """Instagram's own public post query (what the website uses for logged-out visitors).
+    Returns (items, is_video). Empty items when Instagram didn't answer."""
+    variables = json.dumps({"shortcode": code, "fetch_tagged_user_count": None, "hoisted_comment_id": None, "hoisted_reply_id": None})
+    headers = {"X-IG-App-ID": IG_APP_ID, "X-FB-Friendly-Name": "PolarisPostActionLoadPostQueryQuery", "X-ASBD-ID": "129477",
+               "Content-Type": "application/x-www-form-urlencoded", "Origin": "https://www.instagram.com",
+               "Referer": f"https://www.instagram.com/p/{code}/", "Accept-Language": "en-US,en;q=0.9"}
+    body = "variables=" + quote(variables) + "&doc_id=" + IG_DOC_ID
+    for attempt in range(2):
+        text = ""
+        try:
+            from curl_cffi import requests as cr
+            kw = {"proxies": {"http": OUT_PROXY, "https": OUT_PROXY}} if OUT_PROXY else {}
+            with cr.Session(impersonate="chrome") as ss:  # open the post first, like a browser, to get its cookies + LSD token
+                h = dict(headers)
+                try:
+                    pg = ss.get(f"https://www.instagram.com/p/{code}/", headers={"Accept-Language": "en-US,en;q=0.9"}, timeout=15, **kw)
+                    lsd = re.search(r'"LSD",\[\],\{"token":"([^"]+)"', pg.text or "")
+                    if lsd:
+                        h["X-FB-LSD"] = lsd.group(1)
+                    csrf = ss.cookies.get("csrftoken")
+                    if csrf:
+                        h["X-CSRFToken"] = csrf
+                except Exception:
+                    pass
+                for ep in ("https://www.instagram.com/graphql/query", "https://www.instagram.com/api/graphql"):
+                    r = ss.post(ep, data=body + (f"&lsd={h['X-FB-LSD']}" if "X-FB-LSD" in h else ""), headers=h, timeout=20, **kw)
+                    if r.status_code == 200 and '"xdt_shortcode_media"' in (r.text or ""):
+                        text = r.text
+                        break
+        except Exception:
+            try:
+                req = urllib.request.Request("https://www.instagram.com/graphql/query", data=body.encode(), headers={**headers, "User-Agent": UA})
+                with open_url(req, 20) as r:
+                    text = r.read(4_000_000).decode("utf-8", "replace")
+            except Exception:
+                text = ""
+        try:
+            node = ((json.loads(text) or {}).get("data") or {}).get("xdt_shortcode_media") if text else None
+        except ValueError:
+            node = None
+        if isinstance(node, dict):
+            vid = bool(node.get("is_video")) or any(((e or {}).get("node") or {}).get("is_video")
+                                                    for e in (((node.get("edge_sidecar_to_children") or {}).get("edges")) or []))
+            return _ig_node_items(node), vid
+        if attempt == 0:
+            time.sleep(1.0)
+    return [], False
 
 
 def cdn_ok(u: str) -> bool:
@@ -328,23 +406,31 @@ def to_mp3(src: str, folder: str, stem: str) -> str:
 
 
 def instagram_fallback(url: str, folder: str, mode: str) -> str:
-    """Last resort when yt-dlp can't read an Instagram post: read the public embed page and download the media directly."""
-    m = re.search(r"instagram\.com/(?:[^/?#]+/)?(?:p|reels?|tv)/([A-Za-z0-9_-]+)", url)
-    if not m:
+    """When yt-dlp can't read an Instagram post: ask Instagram's public post query, then the public embed pages,
+    and download the media directly. A video post never falls back to its cover picture."""
+    code = ig_code(url)
+    if not code:
         raise RuntimeError("not a post, reel or video link")
-    code = m.group(1)
-    vids, imgs = [], []
-    for page in (f"https://www.instagram.com/p/{code}/embed/captioned/",
-                 f"https://www.instagram.com/reel/{code}/embed/captioned/",
-                 f"https://www.instagram.com/p/{code}/"):
-        text = page_text(page)
-        if not text:
-            continue
-        v, i = ig_media_urls(text)
-        vids += [x for x in v if cdn_ok(x)]
-        imgs += [x for x in i if cdn_ok(x)]
-        if vids:
-            break
+    is_video = ig_url_is_video(url)
+    items, gql_video = ig_graphql(code)
+    is_video = is_video or gql_video
+    vids = [x["src"] for x in items if x["kind"] == "video"]
+    imgs = [x["src"] for x in items if x["kind"] == "image"]
+    if not vids:
+        for page in (f"https://www.instagram.com/p/{code}/embed/captioned/",
+                     f"https://www.instagram.com/reel/{code}/embed/captioned/",
+                     f"https://www.instagram.com/p/{code}/",
+                     f"https://www.instagram.com/reel/{code}/"):
+            text = page_text(page)
+            if not text:
+                continue
+            if IG_VIDEO_HINT.search(_unesc(text)):
+                is_video = True
+            v, i = ig_media_urls(text)
+            vids += [x for x in v if cdn_ok(x)]
+            imgs += [x for x in i if cdn_ok(x)]
+            if vids:
+                break
     stem = f"instagram_{code}"
     last = None
     for u in _uniq(vids):
@@ -356,6 +442,8 @@ def instagram_fallback(url: str, folder: str, mode: str) -> str:
             last = e
     if mode == "audio":
         raise last or RuntimeError("this post has no audio track")
+    if is_video:
+        raise last or RuntimeError("Instagram didn't share this video with the server just now. Please tap Start again in a moment.")
     for u in _uniq(imgs):
         ext = os.path.splitext(urlparse(u).path)[1].lower()
         path = os.path.join(folder, stem + (ext if ext in IMAGE_EXT else ".jpg"))
@@ -494,6 +582,32 @@ def tikwm_items(url: str) -> list[dict]:
     return [{"kind": "image", "src": u} for u in ((d or {}).get("images") or []) if isinstance(u, str) and media_ok(u)]
 
 
+def tiktok_video_fallback(url: str, folder: str, mode: str) -> str:
+    """Download a TikTok video through tikwm when TikTok blocks the server. Photo posts are left to the picture route."""
+    req = urllib.request.Request("https://www.tikwm.com/api/?hd=1&url=" + quote(tiktok_resolve(url), safe=""), headers={"User-Agent": UA})
+    with open_url(req, 20) as r:
+        data = json.loads(r.read(2_000_000).decode("utf-8", "replace"))
+    d = data.get("data") if isinstance(data, dict) and data.get("code") == 0 else None
+    if not d or d.get("images"):
+        raise RuntimeError("no video in this TikTok post")
+    last = None
+    for u in [d.get("hdplay"), d.get("play")]:
+        if not isinstance(u, str) or not u:
+            continue
+        u = urljoin("https://www.tikwm.com/", u)
+        if not media_ok(u):
+            continue
+        path = os.path.join(folder, "tiktok_video.mp4")
+        try:
+            ctype = download_media(u, path)
+            if ctype.startswith("image/"):
+                continue
+            return to_mp3(path, folder, "tiktok_video") if mode == "audio" else path
+        except Exception as e:
+            last = e
+    raise last or RuntimeError("TikTok didn't return a video file")
+
+
 TT_RESOLVED: dict[str, str] = {}
 
 
@@ -617,6 +731,8 @@ def instagram_items(url: str) -> list[dict]:
                     continue
                 is_img = (e.get("ext") or "").lower() in ("jpg", "jpeg", "png", "webp") or urlparse(u).path.lower().endswith(IMAGE_EXT)
                 items.append({"kind": "image" if is_img else "video", "src": u})
+            if ig_url_is_video(url) and not any(x["kind"] == "video" for x in items):
+                items = []
         except Exception as e:
             print(f"[toolora] instagram info (yt-dlp) failed: {ANSI.sub('', str(e))[:300]}", flush=True)
     finally:
@@ -625,12 +741,18 @@ def instagram_items(url: str) -> list[dict]:
                 os.remove(ck)
             except OSError:
                 pass
-    if not items:  # public embed page: only trusted when it shows pictures only (video posts stay on the normal route)
-        m = re.search(r"instagram\.com/(?:[^/?#]+/)?(?:p|reels?|tv)/([A-Za-z0-9_-]+)", url)
-        text = page_text(f"https://www.instagram.com/p/{m.group(1)}/embed/captioned/") if m else ""
+    code = ig_code(url)
+    if not items and code:  # Instagram's own post query lists every picture and video of a carousel
+        gitems, gvid = ig_graphql(code)
+        if len(gitems) > 1 or (gitems and not gvid):
+            items = gitems
+        elif gvid:
+            return []  # a single video: the normal video route downloads it
+    if not items and code and not ig_url_is_video(url):  # embed page: only trusted when it shows pictures only
+        text = page_text(f"https://www.instagram.com/p/{code}/embed/captioned/")
         if text:
             v, i = ig_media_urls(text)
-            if not [x for x in v if cdn_ok(x)]:
+            if not [x for x in v if cdn_ok(x)] and not IG_VIDEO_HINT.search(_unesc(text)):
                 seen = set()
                 for x in i:
                     key = urlparse(x).path
@@ -786,7 +908,8 @@ def attempts_for(mode: str, url: str) -> list[dict]:
                  {"format": "best", "_lower": True}]
     # Clients that need no JavaScript challenge solving go first: they answer in a second or two even on a small
     # server, while the web clients can take a minute there. yt-dlp's own default mix goes last as the catch-all.
-    clients = ["android_vr", "visionos", "tv", "web_safari", "mweb", "web_embedded", "ios", "android", "tv_simply", "web"]
+    # With the PO-token helper running (see Dockerfile), mweb / web pass YouTube's "not a bot" check, so they go early.
+    clients = ["android_vr", "mweb", "web_safari", "tv", "visionos", "web_embedded", "tv_simply", "web", "ios", "android"]
     out = []
     for client in clients:
         out.append({**chain[0], "extractor_args": {"youtube": {"player_client": [client]}}, "remote_components": ["ejs:github"]})
@@ -828,9 +951,35 @@ def pinterest_fallback(url: str, folder: str) -> str:
     candidates = _uniq([urljoin(url, html.unescape(x)) for x in candidates])
 
     # Prefer video streams when present, but allow a normal photo Pin as the primary result.
-    ordered = [x for x in candidates if re.search(r'\.(?:mp4|m3u8)(?:[?#]|$)|/videos?/', urlparse(x).path, re.I)]
-    ordered += [x for x in candidates if x not in ordered and "pinimg.com" in (urlparse(x).hostname or "").lower()]
+    videos = [x for x in candidates if re.search(r'\.(?:mp4|m3u8)(?:[?#]|$)|/videos?/', urlparse(x).path, re.I)
+              and "/thumbnails/" not in urlparse(x).path and not urlparse(x).path.lower().endswith(IMAGE_EXT + (".gif",))]
+    mp4s = []
+    for x in videos:  # HLS playlists have a ready-made MP4 next to them (…/720p/…mp4)
+        if x.lower().split("?")[0].endswith(".m3u8"):
+            mp4s += [re.sub(r"/(?:hls|expMp4)/", f"/{q}/", x).split("?")[0][:-5] + ".mp4" for q in ("720p", "1080p")]
+    videos = _uniq([x for x in videos if not x.lower().split("?")[0].endswith(".m3u8")] + mp4s
+                   + [x for x in videos if x.lower().split("?")[0].endswith(".m3u8")])
     last = None
+    for media_url in videos:
+        if not media_ok(media_url):
+            continue
+        out = os.path.join(folder, "pinterest_download.mp4")
+        try:
+            if media_url.lower().split("?")[0].endswith(".m3u8"):
+                r = subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-headers", "Referer: https://www.pinterest.com/\r\n",
+                                    "-i", media_url, "-c", "copy", "-bsf:a", "aac_adtstoasc", out], capture_output=True, timeout=180)
+                if r.returncode == 0 and os.path.isfile(out) and os.path.getsize(out) > 0:
+                    return out
+                raise RuntimeError("Pinterest's video stream couldn't be read")
+            ctype = download_media(media_url, out)
+            if ctype.startswith("video/") or ctype == "application/octet-stream":
+                return out
+            os.remove(out)
+        except Exception as e:
+            last = e
+    if videos:  # this Pin is a video: never hand back its cover picture
+        raise last or RuntimeError("Pinterest didn't share this video just now. Please try again in a moment.")
+    ordered = [x for x in candidates if "pinimg.com" in (urlparse(x).hostname or "").lower()]
     for media_url in ordered:
         if not media_ok(media_url):
             continue
@@ -926,13 +1075,16 @@ def fetch(url: str, folder: str, mode: str = "video") -> str:
                         raise  # private / removed / copyright: no other client can help
                     if "sign in to confirm" in msg or "not a bot" in msg:
                         blocked += 1
-                        if blocked >= 4:
+                        if blocked >= 8:
                             raise  # YouTube is blocking this server's address; more clients won't change that
                     continue
                 if mode == "audio" or "requested format" not in msg:
                     raise
                 continue
             path = pick_file(folder, mode)
+            if path and insta and mode == "video" and path.lower().endswith(IMAGE_EXT) and ig_url_is_video(url):
+                last = RuntimeError("Instagram only returned the cover picture")
+                continue  # a reel must come back as a video, never its cover picture
             if path:
                 return path
             capped = True
@@ -943,6 +1095,12 @@ def fetch(url: str, folder: str, mode: str = "video") -> str:
             except Exception as e:
                 if last is None:
                     last = e
+        if is_tiktok(url):  # second source for TikTok videos when yt-dlp is blocked
+            clear_folder(folder)
+            try:
+                return tiktok_video_fallback(orig, folder, mode)
+            except Exception as e:
+                print(f"[toolora] tiktok video fallback failed {url[:120]}: {ANSI.sub('', str(e))[:200]}", flush=True)
         if is_tiktok(url) and mode == "video":  # photo posts that yt-dlp can't read: hand back the first picture
             clear_folder(folder)
             try:
