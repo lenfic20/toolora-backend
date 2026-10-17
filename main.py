@@ -14,6 +14,7 @@ Env vars (all optional):
   PROXY_SECRET      shared secret sent by the Toolora worker; when set, /download only accepts requests that carry it
   RAPIDAPI_KEY      (optional) RapidAPI key; YouTube MP3 downloads use the RapidAPI service first, yt-dlp is the backup.
                     Also: RAPIDAPI_HOST, RAPIDAPI_MP3_QUALITY (default low), RAPIDAPI_DAILY_LIMIT (default 200),
+                    RAPIDAPI_DEBUG=1 (show why RapidAPI failed in the error message while testing),
                     RAPIDAPI_VIDEO_HOST, RAPIDAPI_VIDEO=0 (turn off video), RAPIDAPI_VIDEO_DAILY_LIMIT (default 100).
   COOKIES_TXT       (optional) browser cookies in Netscape cookies.txt format. Lets Instagram/YouTube serve the server
                     like a logged-in browser, which fixes "login required" / "sign in to confirm" blocks.
@@ -867,6 +868,8 @@ RAPIDAPI_HOST = os.getenv("RAPIDAPI_HOST", "youtube-mp3-audio-video-downloader.p
 RAPIDAPI_QUALITY = os.getenv("RAPIDAPI_MP3_QUALITY", "low").strip()
 RAPIDAPI_DAILY = int(os.getenv("RAPIDAPI_DAILY_LIMIT", "200"))
 _rapid_used: dict[str, int] = {}
+RAPIDAPI_DEBUG = os.getenv("RAPIDAPI_DEBUG", "").strip() == "1"  # show why RapidAPI failed in the error message (for testing)
+RAPID_NOTES: dict[str, str] = {}
 
 
 def yt_video_id(url: str) -> str:
@@ -898,8 +901,16 @@ def _rapid_json(path: str, timeout: int = 75, host: str | None = None):
     host = host or RAPIDAPI_HOST
     req = urllib.request.Request("https://" + host + path,
                                  headers={"x-rapidapi-key": RAPIDAPI_KEY, "x-rapidapi-host": host, "Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode("utf-8", "replace"))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", "replace")[:160]
+        except Exception:
+            pass
+        raise RuntimeError(f"RapidAPI answered HTTP {e.code} {body}".strip())
 
 
 def _find_link(obj):
@@ -1056,17 +1067,21 @@ def rapid_video(url: str, folder: str) -> str:
 def fetch(url: str, folder: str, mode: str = "video") -> str:
     orig = url.strip()
     url = normalize_url(url)
+    if not RAPIDAPI_KEY and is_youtube(url) and mode in ("audio", "video"):
+        RAPID_NOTES[folder] = "RapidAPI is not used: the RAPIDAPI_KEY setting is empty on this server"
     if mode == "video" and RAPIDAPI_KEY and RAPIDAPI_VIDEO_ON and is_youtube(url):
         try:
             return rapid_video(url, folder)
         except Exception as e:
             print(f"[toolora] rapidapi video failed, using yt-dlp: {ANSI.sub('', str(e))[:300]}", flush=True)
+            RAPID_NOTES[folder] = f"RapidAPI video: {ANSI.sub('', str(e))[:180]}"
             clear_folder(folder)
     if mode == "audio" and RAPIDAPI_KEY and is_youtube(url):
         try:
             return rapid_audio(url, folder)
         except Exception as e:
             print(f"[toolora] rapidapi audio failed, using yt-dlp: {ANSI.sub('', str(e))[:300]}", flush=True)
+            RAPID_NOTES[folder] = f"RapidAPI audio: {ANSI.sub('', str(e))[:180]}"
             clear_folder(folder)
     if is_snapchat(url):
         url = snap_resolve(url)
@@ -1245,9 +1260,13 @@ async def download(req: Req, request: Request):
         shutil.rmtree(folder, ignore_errors=True)
         print(f"[toolora] download failed ({req.mode}) {link[:120]}: {ANSI.sub('', str(e))[:600]}", flush=True)
         reason = clean_error(e)
+        note = RAPID_NOTES.pop(folder, "")
+        if RAPIDAPI_DEBUG and note:
+            reason += f" [{note}]"
         what = "extract the audio from" if req.mode == "audio" else "download"
         target = "that media" if is_pinterest(link) else "that video"
         raise HTTPException(422, f"Couldn't {what} {target}: {reason}")
+    RAPID_NOTES.pop(folder, None)
     ext = os.path.splitext(path)[1].lower()
     media = {".mp3": "audio/mpeg", ".mp4": "video/mp4", ".webm": "video/webm", ".mkv": "video/x-matroska", ".mov": "video/quicktime", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp"}.get(ext, "application/octet-stream")
     return FileResponse(path, media_type=media, filename=os.path.basename(path), background=cleanup)
