@@ -12,6 +12,9 @@ Env vars (all optional):
   MAX_CONCURRENT    simultaneous downloads (default 3)
   RATE_PER_MINUTE   requests per IP per minute (default 10)
   PROXY_SECRET      shared secret sent by the Toolora worker; when set, /download only accepts requests that carry it
+  RAPIDAPI_KEY      (optional) RapidAPI key; YouTube MP3 downloads use the RapidAPI service first, yt-dlp is the backup.
+                    Also: RAPIDAPI_HOST, RAPIDAPI_MP3_QUALITY (default low), RAPIDAPI_DAILY_LIMIT (default 200),
+                    RAPIDAPI_VIDEO_HOST, RAPIDAPI_VIDEO=0 (turn off video), RAPIDAPI_VIDEO_DAILY_LIMIT (default 100).
   COOKIES_TXT       (optional) browser cookies in Netscape cookies.txt format. Lets Instagram/YouTube serve the server
                     like a logged-in browser, which fixes "login required" / "sign in to confirm" blocks.
                     Alternatives: COOKIES_B64 (the same file, base64-encoded) or a Render Secret File named cookies.txt
@@ -21,7 +24,7 @@ Env vars (all optional):
                     residential proxy is only used where it is needed
 """
 import asyncio, base64, hmac, html, json, os, re, shutil, subprocess, tempfile, time
-import urllib.error, urllib.request
+import ipaddress, socket, urllib.error, urllib.request
 from typing import Literal
 from collections import defaultdict, deque
 from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse
@@ -243,6 +246,10 @@ def clean_error(e: BaseException) -> str:
     if "sign in to confirm" in low and "bot" in low:
         msg = ("YouTube is refusing this server's connection right now (it asked to confirm the visitor is not a bot). "
                "Please try again in a few minutes.")
+    elif "this content isn't available to everyone" in low or "this content is not available to everyone" in low:
+        msg = ("Instagram restricts this post to certain audiences. If the post is visible in your own Instagram account, "
+               "configure a valid COOKIES_TXT value on the backend using cookies from an account authorized to view it, "
+               "then redeploy. If that account cannot view the post, Toolora cannot download it.")
     return msg[:360]
 
 
@@ -273,25 +280,6 @@ def ig_media_urls(page: str):
     imgs += re.findall(r'class=["\'][^"\']*EmbeddedMediaImage[^"\']*["\'][^>]+src=["\'](https?://[^"\']+)', t)
     imgs += re.findall(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\'](https?://[^"\']+)', t)
     return _uniq(vids), _uniq(imgs)
-
-
-def ig_is_video(page: str, url: str = "") -> bool:
-    """True when an Instagram post is a video: reels and IGTV links always are, otherwise the page data says so.
-    Several-item posts (carousels) are left out on purpose: they can mix pictures and videos."""
-    km = re.search(r"instagram\.com/(?:[^/?#]+/)?(p|reels?|tv)/", url or "", re.I)
-    if km and km.group(1).lower() != "p":
-        return True
-    t = _unesc(page or "")
-    if re.search(r"edge_sidecar_to_children|GraphSidecar|carousel_media", t):
-        return False
-    return bool(re.search(
-        r'is_video\\*"\s*:\s*true'
-        r'|__typename\\*"\s*:\s*\\*"GraphVideo'
-        r'|media_type\\*"\s*:\s*2\b'
-        r'|product_type\\*"\s*:\s*\\*"clips'
-        r'|video_url\\*"\s*:\s*\\*"https?:'
-        r'|<meta[^>]+property=["\']og:video',
-        t, re.I))
 
 
 def cdn_ok(u: str) -> bool:
@@ -352,7 +340,6 @@ def instagram_fallback(url: str, folder: str, mode: str) -> str:
     if not m:
         raise RuntimeError("not a post, reel or video link")
     code = m.group(1)
-    is_vid = ig_is_video("", url)  # reel / IGTV links are always videos
     vids, imgs = [], []
     for page in (f"https://www.instagram.com/p/{code}/embed/captioned/",
                  f"https://www.instagram.com/reel/{code}/embed/captioned/",
@@ -361,7 +348,6 @@ def instagram_fallback(url: str, folder: str, mode: str) -> str:
         if not text:
             continue
         v, i = ig_media_urls(text)
-        is_vid = is_vid or ig_is_video(text, url)
         vids += [x for x in v if cdn_ok(x)]
         imgs += [x for x in i if cdn_ok(x)]
         if vids:
@@ -377,9 +363,6 @@ def instagram_fallback(url: str, folder: str, mode: str) -> str:
             last = e
     if mode == "audio":
         raise last or RuntimeError("this post has no audio track")
-    if is_vid:  # a video must never be answered with its cover picture
-        raise last or RuntimeError("Instagram did not let the server read this video. The post may be private or "
-                                   "restricted, or Instagram is temporarily blocking the server. Please try again in a moment.")
     for u in _uniq(imgs):
         ext = os.path.splitext(urlparse(u).path)[1].lower()
         path = os.path.join(folder, stem + (ext if ext in IMAGE_EXT else ".jpg"))
@@ -654,7 +637,7 @@ def instagram_items(url: str) -> list[dict]:
         text = page_text(f"https://www.instagram.com/p/{m.group(1)}/embed/captioned/") if m else ""
         if text:
             v, i = ig_media_urls(text)
-            if not [x for x in v if cdn_ok(x)] and not ig_is_video(text, url):
+            if not [x for x in v if cdn_ok(x)]:
                 seen = set()
                 for x in i:
                     key = urlparse(x).path
@@ -877,9 +860,214 @@ def pinterest_fallback(url: str, folder: str) -> str:
     raise last or RuntimeError("Pinterest did not expose a downloadable image or video for this Pin. The Pin may be private, restricted, or temporarily blocked.")
 
 
+# ---- YouTube audio through RapidAPI (optional) ----
+# Set RAPIDAPI_KEY on the server to use it. yt-dlp stays as the automatic backup if the API fails or the daily cap is reached.
+RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY", "").strip()
+RAPIDAPI_HOST = os.getenv("RAPIDAPI_HOST", "youtube-mp3-audio-video-downloader.p.rapidapi.com").strip()
+RAPIDAPI_QUALITY = os.getenv("RAPIDAPI_MP3_QUALITY", "low").strip()
+RAPIDAPI_DAILY = int(os.getenv("RAPIDAPI_DAILY_LIMIT", "200"))
+_rapid_used: dict[str, int] = {}
+
+
+def yt_video_id(url: str) -> str:
+    p = urlparse(url.strip())
+    host = (p.hostname or "").lower()
+    if host == "youtu.be" or host.endswith(".youtu.be"):
+        vid = p.path.strip("/").split("/")[0]
+    else:
+        q = parse_qs(p.query).get("v")
+        parts = [x for x in p.path.split("/") if x]
+        vid = q[0] if q else (parts[1] if len(parts) > 1 and parts[0] in ("shorts", "embed", "live", "v") else "")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{11}", vid or ""):
+        raise RuntimeError("could not read the YouTube video id")
+    return vid
+
+
+def _rapid_quota_ok(bucket: str = "audio", limit: int | None = None) -> bool:
+    day = time.strftime("%Y-%m-%d", time.gmtime()) + bucket
+    cap = RAPIDAPI_DAILY if limit is None else limit
+    for k in [k for k in _rapid_used if k.endswith(bucket) and k != day]:
+        del _rapid_used[k]
+    if _rapid_used.get(day, 0) >= cap:
+        return False
+    _rapid_used[day] = _rapid_used.get(day, 0) + 1
+    return True
+
+
+def _rapid_json(path: str, timeout: int = 75, host: str | None = None):
+    host = host or RAPIDAPI_HOST
+    req = urllib.request.Request("https://" + host + path,
+                                 headers={"x-rapidapi-key": RAPIDAPI_KEY, "x-rapidapi-host": host, "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8", "replace"))
+
+
+def _find_link(obj):
+    """The API's JSON shape is not documented, so look for the file link under the usual key names, then anywhere."""
+    prefer = ("file", "link", "url", "download", "downloadurl", "download_url", "dlink", "download_link", "mp3", "audio")
+    if isinstance(obj, dict):
+        low = {str(k).lower(): v for k, v in obj.items()}
+        for k in prefer:
+            v = low.get(k)
+            if isinstance(v, str) and v.startswith("http"):
+                return v
+        for v in obj.values():
+            r = _find_link(v)
+            if r:
+                return r
+    elif isinstance(obj, list):
+        for v in obj:
+            r = _find_link(v)
+            if r:
+                return r
+    elif isinstance(obj, str) and obj.startswith("https://") and not re.search(r"\.(jpe?g|png|webp|gif)(\?|$)", obj, re.I) and "ytimg.com" not in obj:
+        return obj
+    return None
+
+
+def _public_https(u: str) -> bool:
+    try:
+        p = urlparse(u)
+        if p.scheme != "https" or not p.hostname:
+            return False
+        for info in socket.getaddrinfo(p.hostname, p.port or 443, proto=socket.IPPROTO_TCP):
+            ip = ipaddress.ip_address(info[4][0])
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+class _PublicRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not _public_https(newurl):
+            raise urllib.error.URLError("redirect to a host that is not allowed")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _save_file(u: str, path: str) -> None:
+    """Download the finished file. The link can take a few seconds to become ready, so a few retries are allowed."""
+    if not _public_https(u):
+        raise RuntimeError("the audio link was not usable")
+    limit = MAX_MB * 1024 * 1024
+    last = None
+    for attempt in range(6):
+        try:
+            req = urllib.request.Request(u, headers={"User-Agent": UA, "Accept": "*/*"})
+            got = 0
+            with urllib.request.build_opener(_PublicRedirect()).open(req, timeout=45) as r, open(path, "wb") as fh:
+                while True:
+                    chunk = r.read(1 << 16)
+                    if not chunk:
+                        break
+                    got += len(chunk)
+                    if got > limit:
+                        raise RuntimeError(f"the file is larger than the {MAX_MB} MB limit")
+                    fh.write(chunk)
+            if got > 10_000:
+                return
+            last = RuntimeError("the audio file was empty")
+        except urllib.error.HTTPError as e:
+            last = e
+            if e.code not in (403, 404, 409, 423, 425, 429, 500, 502, 503):
+                break
+        except urllib.error.URLError as e:
+            last = e
+        time.sleep(3)
+    raise RuntimeError(f"could not fetch the audio file: {last}")
+
+
+def rapid_audio(url: str, folder: str) -> str:
+    if not _rapid_quota_ok():
+        raise RuntimeError("daily RapidAPI limit reached")
+    vid = yt_video_id(url)
+    data = _rapid_json(f"/get_mp3_download_link/{vid}?quality={quote(RAPIDAPI_QUALITY)}&wait_until_the_file_is_ready=true")
+    link = _find_link(data)
+    if not link:
+        raise RuntimeError("RapidAPI gave no download link: " + json.dumps(data)[:200])
+    title = ""
+    if isinstance(data, dict):
+        title = str(data.get("title") or data.get("name") or "")
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", title).strip("._")[:80] or "YouTube"
+    out = os.path.join(folder, f"{stem}_{vid}.mp3")
+    _save_file(link, out)
+    return out
+
+
+RAPIDAPI_VIDEO_HOST = os.getenv("RAPIDAPI_VIDEO_HOST", "youtube-media-downloader.p.rapidapi.com").strip()
+RAPIDAPI_VIDEO_ON = os.getenv("RAPIDAPI_VIDEO", "1").strip() != "0"
+RAPIDAPI_VIDEO_DAILY = int(os.getenv("RAPIDAPI_VIDEO_DAILY_LIMIT", "100"))
+
+
+def _height(it: dict) -> int:
+    for k in ("height", "quality", "qualityLabel", "label"):
+        m = re.search(r"(\d{3,4})", str(it.get(k) or ""))
+        if m:
+            return int(m.group(1))
+    return 0
+
+
+def _is_mp4(it: dict) -> bool:
+    return "mp4" in (str(it.get("extension") or "") + str(it.get("mimeType") or it.get("mime") or "")).lower() or not (it.get("extension") or it.get("mimeType") or it.get("mime"))
+
+
+def _items(block) -> list:
+    if isinstance(block, dict):
+        block = block.get("items") or block.get("list") or []
+    return [x for x in block if isinstance(x, dict) and isinstance(x.get("url"), str) and x["url"].startswith("http")] if isinstance(block, list) else []
+
+
+def rapid_video(url: str, folder: str) -> str:
+    if not _rapid_quota_ok("video", RAPIDAPI_VIDEO_DAILY):
+        raise RuntimeError("daily RapidAPI video limit reached")
+    vid = yt_video_id(url)
+    data = _rapid_json(f"/v2/video/details?videoId={vid}&urlAccess=normal&videos=auto&audios=auto", host=RAPIDAPI_VIDEO_HOST)
+    if not isinstance(data, dict):
+        raise RuntimeError("unexpected RapidAPI answer")
+    if data.get("status") is False:
+        raise RuntimeError("RapidAPI: " + str(data.get("errorId") or data.get("reason") or data)[:200])
+    cap = MAX_MB * 1024 * 1024
+    vids = [v for v in _items(data.get("videos")) if _is_mp4(v) and 0 < _height(v) <= 1080 and (not isinstance(v.get("size"), (int, float)) or v["size"] <= cap)]
+    auds = [a for a in _items(data.get("audios")) if "webm" not in str(a.get("extension") or a.get("mimeType") or "").lower() and "opus" not in str(a.get("mimeType") or "").lower()]
+    if not vids:
+        raise RuntimeError("RapidAPI returned no usable video: " + json.dumps(data)[:200])
+    pick = max(vids, key=lambda v: (_height(v), v.get("hasAudio") is True))  # sharpest first; a merge adds the sound if it is missing
+    title = str(data.get("title") or "")
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", title).strip("._")[:80] or "YouTube"
+    out = os.path.join(folder, f"{stem}_{vid}.mp4")
+    if pick.get("hasAudio") is True or not auds:
+        _save_file(pick["url"], out)
+        return out
+    vpath, apath = os.path.join(folder, "v.part.mp4"), os.path.join(folder, "a.part.m4a")
+    _save_file(pick["url"], vpath)
+    _save_file(max(auds, key=lambda a: a.get("bitrate") or a.get("size") or 0)["url"], apath)
+    r = subprocess.run(["ffmpeg", "-y", "-i", vpath, "-i", apath, "-c", "copy", "-movflags", "+faststart", out], capture_output=True, timeout=150)
+    if r.returncode != 0 or not os.path.exists(out) or os.path.getsize(out) < 10_000:
+        raise RuntimeError("could not join the video and audio")
+    for p in (vpath, apath):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+    return out
+
+
 def fetch(url: str, folder: str, mode: str = "video") -> str:
     orig = url.strip()
     url = normalize_url(url)
+    if mode == "video" and RAPIDAPI_KEY and RAPIDAPI_VIDEO_ON and is_youtube(url):
+        try:
+            return rapid_video(url, folder)
+        except Exception as e:
+            print(f"[toolora] rapidapi video failed, using yt-dlp: {ANSI.sub('', str(e))[:300]}", flush=True)
+            clear_folder(folder)
+    if mode == "audio" and RAPIDAPI_KEY and is_youtube(url):
+        try:
+            return rapid_audio(url, folder)
+        except Exception as e:
+            print(f"[toolora] rapidapi audio failed, using yt-dlp: {ANSI.sub('', str(e))[:300]}", flush=True)
+            clear_folder(folder)
     if is_snapchat(url):
         url = snap_resolve(url)
     base = {
