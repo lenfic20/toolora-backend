@@ -25,8 +25,7 @@ COPY requirements.txt .
 # YouTube fixes first). Then its dependencies WITHOUT -U, so pip keeps that nightly and installs the exact
 # yt-dlp-ejs version it was built against (YouTube's challenge solver must match) plus curl-cffi, which
 # current yt-dlp needs to read Instagram by impersonating a real browser.
-RUN pip install --no-cache-dir -U --pre --no-deps yt-dlp \
-    && pip install --no-cache-dir "yt-dlp[default,curl-cffi]" fastapi "uvicorn[standard]" \
+RUN pip install --no-cache-dir "yt-dlp[default,curl-cffi]==2026.10.10.233141.dev0" fastapi "uvicorn[standard]" \
     && python -c "import yt_dlp, yt_dlp_ejs, curl_cffi; print('yt-dlp', yt_dlp.version.__version__, '| ejs', yt_dlp_ejs.version, '| curl_cffi', curl_cffi.__version__)"
 
 COPY main.py .
