@@ -890,7 +890,7 @@ def _find_link(obj):
         low = {str(k).lower(): v for k, v in obj.items()}
         for k in prefer:
             v = low.get(k)
-            if isinstance(v, str) and v.startswith("http"):
+            if isinstance(v, str) and v.startswith("http") and not re.match(r"https?://([a-z0-9-]+\.)?(youtube\.com|youtu\.be)/", v, re.I):
                 return v
         for v in obj.values():
             r = _find_link(v)
@@ -901,7 +901,7 @@ def _find_link(obj):
             r = _find_link(v)
             if r:
                 return r
-    elif isinstance(obj, str) and obj.startswith("https://") and not re.search(r"\.(jpe?g|png|webp|gif)(\?|$)", obj, re.I) and "ytimg.com" not in obj:
+    elif isinstance(obj, str) and obj.startswith("https://") and not re.search(r"^https://([a-z0-9-]+\.)?(youtube\.com|youtu\.be)/", obj, re.I) and not re.search(r"\.(jpe?g|png|webp|gif)(\?|$)", obj, re.I) and "ytimg.com" not in obj:
         return obj
     return None
 
@@ -928,14 +928,24 @@ class _PublicRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def _save_file(u: str, path: str) -> None:
-    """Download the finished file. The link can take a few seconds to become ready, so a few retries are allowed."""
+    """Download the finished file. Some links are picky about headers or need a few seconds to become ready,
+    so each attempt uses a different set of headers and a few retries are allowed."""
     if not _public_https(u):
-        raise RuntimeError("the audio link was not usable")
+        raise RuntimeError("the download link was not usable")
+    host = (urlparse(u).hostname or "").lower()
     limit = MAX_MB * 1024 * 1024
+    variants = [
+        {"User-Agent": UA, "Accept": "*/*"},
+        {"User-Agent": UA, "Accept": "*/*", "Referer": "https://" + RAPIDAPI_HOST.replace(".p.rapidapi.com", "") + "/", "Origin": "https://rapidapi.com"},
+        {"User-Agent": "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36", "Accept": "*/*", "Range": "bytes=0-"},
+        {"Accept": "*/*"},
+    ]
+    if host.endswith(".rapidapi.com"):  # files served by the API itself may need the key
+        variants.insert(0, {"x-rapidapi-key": RAPIDAPI_KEY, "x-rapidapi-host": host, "Accept": "*/*"})
     last = None
-    for attempt in range(6):
+    for attempt in range(len(variants) + 2):
         try:
-            req = urllib.request.Request(u, headers={"User-Agent": UA, "Accept": "*/*"})
+            req = urllib.request.Request(u, headers=variants[attempt % len(variants)])
             got = 0
             with urllib.request.build_opener(_PublicRedirect()).open(req, timeout=45) as r, open(path, "wb") as fh:
                 while True:
@@ -948,15 +958,20 @@ def _save_file(u: str, path: str) -> None:
                     fh.write(chunk)
             if got > 10_000:
                 return
-            last = RuntimeError("the audio file was empty")
+            last = RuntimeError("the file was empty")
         except urllib.error.HTTPError as e:
-            last = e
-            if e.code not in (403, 404, 409, 423, 425, 429, 500, 502, 503):
+            body = ""
+            try:
+                body = re.sub(r"\s+", " ", e.read().decode("utf-8", "replace"))[:90]
+            except Exception:
+                pass
+            last = RuntimeError(f"HTTP {e.code} from {host} {body}".strip())
+            if e.code not in (401, 403, 404, 409, 423, 425, 429, 500, 502, 503):
                 break
         except urllib.error.URLError as e:
             last = e
-        time.sleep(3)
-    raise RuntimeError(f"could not fetch the audio file: {last}")
+        time.sleep(2)
+    raise RuntimeError(f"could not fetch the media file: {last}")
 
 
 def rapid_audio(url: str, folder: str) -> str:
