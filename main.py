@@ -1069,10 +1069,87 @@ def _video_json(vid: str):
     return _rapid_json(f"/download.php?id={quote(vid)}", host=RAPIDAPI_VIDEO_HOST)
 
 
+RAPIDAPI_FAST_HOST = os.getenv("RAPIDAPI_FAST_VIDEO_HOST", "youtube-video-fast-downloader-24-7.p.rapidapi.com").strip()
+RAPIDAPI_FAST_MAX_HEIGHT = int(os.getenv("RAPIDAPI_FAST_MAX_HEIGHT", "720"))
+
+
+def _save_when_ready(u: str, path: str, wait: int = 100) -> None:
+    """The fast service prepares the file on its own server; the link answers 404 until it is ready."""
+    deadline = time.monotonic() + wait
+    while True:
+        try:
+            _save_file(u, path)
+            return
+        except Exception as e:
+            if "HTTP 404" not in str(e) or time.monotonic() > deadline:
+                raise
+            time.sleep(4)
+
+
+def rapid_video_fast(url: str, vid: str, folder: str) -> str:
+    """Video from youtube-video-fast-downloader-24-7. Its file links live on the API's own server,
+    so they are not locked to the API's IP like raw googlevideo.com links (those give HTTP 403 from Render)."""
+    opts = _rapid_json(f"/get_available_quality/{quote(vid)}", host=RAPIDAPI_FAST_HOST)
+    if isinstance(opts, dict) and isinstance(opts.get("url"), str) and not any(isinstance(v, list) for v in opts.values()):
+        raise RuntimeError("RapidAPI fast video: unexpected answer " + json.dumps(opts)[:160])
+    items = opts if isinstance(opts, list) else next((v for v in opts.values() if isinstance(v, list)), []) if isinstance(opts, dict) else []
+    cap = MAX_MB * 1024 * 1024
+    cands = []
+    for it in items:
+        if not isinstance(it, dict) or str(it.get("type", "video")).lower() != "video" or it.get("id") is None:
+            continue
+        h = _height(it)
+        try:
+            size = int(str(it.get("size") or 0).strip('"\\ ') or 0)
+        except ValueError:
+            size = 0
+        if h > RAPIDAPI_FAST_MAX_HEIGHT or (size and size > cap):
+            continue
+        mp4 = "mp4" in str(it.get("mime") or "").lower()
+        cands.append((mp4, h, it))
+    if not cands:
+        raise RuntimeError("RapidAPI fast video: no usable quality " + json.dumps(items)[:160])
+    cands.sort(key=lambda c: (c[0], c[1]), reverse=True)
+    kind = "download_short" if "/shorts/" in url.lower() else "download_video"
+    errors = []
+    for mp4, h, it in cands[:2]:
+        try:
+            data = _rapid_json(f"/{kind}/{quote(vid)}?quality={quote(str(it['id']))}", host=RAPIDAPI_FAST_HOST)
+            link = data.get("file") if isinstance(data, dict) else None
+            if not isinstance(link, str) or not link.startswith("http"):
+                link = _find_link(data)
+            if not link:
+                raise RuntimeError("no file link: " + json.dumps(data)[:160])
+            title = str(data.get("title") or "") if isinstance(data, dict) else ""
+            stem = re.sub(r"[^A-Za-z0-9._-]+", "_", title).strip("._")[:80] or "YouTube"
+            ext = ".mp4" if mp4 or "mp4" in str(data.get("mime") if isinstance(data, dict) else "").lower() else ".webm"
+            out = os.path.join(folder, f"{stem}_{vid}{ext}")
+            _save_when_ready(link, out)
+            return out
+        except Exception as e:
+            errors.append(str(e)[:140])
+            clear_folder(folder)
+    raise RuntimeError("fast video: " + "; ".join(errors))
+
+
 def rapid_video(url: str, folder: str) -> str:
     if not _rapid_quota_ok("video", RAPIDAPI_VIDEO_DAILY):
         raise RuntimeError("daily RapidAPI video limit reached")
     vid = yt_video_id(url)
+    try:
+        return rapid_video_fast(url, vid, folder)
+    except Exception as e:
+        first = str(e)[:200]
+        print(f"[toolora] rapidapi fast video failed {vid}: {first}", flush=True)
+        clear_folder(folder)
+    try:
+        return _rapid_video_raw(vid, folder)
+    except Exception as e:
+        raise RuntimeError(f"{first} | backup: {str(e)[:150]}")
+
+
+def _rapid_video_raw(vid: str, folder: str) -> str:
+    """Backup: youtube-video-and-shorts-downloader. Its links are often IP-locked, so it only sometimes works."""
     data = _video_json(vid)
     if isinstance(data, dict) and (
         data.get("error")
