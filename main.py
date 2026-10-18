@@ -12,17 +12,14 @@ Env vars (all optional):
   MAX_CONCURRENT    simultaneous downloads (default 3)
   RATE_PER_MINUTE   requests per IP per minute (default 10)
   PROXY_SECRET      shared secret sent by the Toolora worker; when set, /download only accepts requests that carry it
-  RAPIDAPI_KEY      (optional) RapidAPI key; YouTube MP3 downloads use the RapidAPI service first, yt-dlp is the backup.
+  RAPIDAPI_KEY      RapidAPI key. YouTube downloads (MP3 and video) use RapidAPI only; yt-dlp serves the other platforms.
                     Also: RAPIDAPI_HOST, RAPIDAPI_MP3_QUALITY (default low), RAPIDAPI_DAILY_LIMIT (default 200),
-                    RAPIDAPI_DEBUG=1 (show why RapidAPI failed in the error message while testing),
-                    RAPIDAPI_VIDEO_HOST, RAPIDAPI_VIDEO=0 (turn off video), RAPIDAPI_VIDEO_DAILY_LIMIT (default 100).
-  COOKIES_TXT       (optional) browser cookies in Netscape cookies.txt format. Lets Instagram/YouTube serve the server
-                    like a logged-in browser, which fixes "login required" / "sign in to confirm" blocks.
+                    RAPIDAPI_VIDEO_HOST, RAPIDAPI_VIDEO_DAILY_LIMIT (default 100), RAPIDAPI_HIDE_ERRORS=1 (hide technical reasons).
+  COOKIES_TXT       (optional) browser cookies in Netscape cookies.txt format. Lets Instagram serve the server
+                    like a logged-in browser, which fixes "login required" blocks.
                     Alternatives: COOKIES_B64 (the same file, base64-encoded) or a Render Secret File named cookies.txt
   MAX_SECONDS       give up on a link after this many seconds of trying different methods (default 80)
   YTDLP_PROXY       (optional) proxy URL such as http://user:pass@host:port, used for every outgoing request
-  YT_PROXY          (optional) proxy URL used ONLY for YouTube (overrides YTDLP_PROXY for YouTube links), so a paid
-                    residential proxy is only used where it is needed
 """
 import asyncio, base64, hmac, html, json, os, re, shutil, subprocess, tempfile, time
 import ipaddress, socket, urllib.error, urllib.request
@@ -44,7 +41,6 @@ MAX_MB = int(os.getenv("MAX_FILESIZE_MB", "200"))
 RATE = int(os.getenv("RATE_PER_MINUTE", "10"))
 PROXY_SECRET = os.getenv("PROXY_SECRET", "")
 OUT_PROXY = os.getenv("YTDLP_PROXY", "").strip()
-YT_PROXY = os.getenv("YT_PROXY", "").strip()
 BUDGET = float(os.getenv("MAX_SECONDS", "80"))
 slots = asyncio.Semaphore(int(os.getenv("MAX_CONCURRENT", "3")))
 file_slots = asyncio.Semaphore(4)  # picture / slide file transfers (light, so they do not wait behind video downloads)
@@ -99,9 +95,7 @@ def valid_url(u: str) -> bool:
 
 
 SORT = ["res", "ext:mp4:m4a"]  # best resolution, preferring MP4/M4A so the result plays on phones
-YT_SORT = ["res:1080", "vcodec:h264", "acodec:aac", "ext:mp4:m4a"]  # YouTube: up to 1080p, phone-friendly codecs
 FRAGMENT = re.compile(r"\.f[\w-]+\.[A-Za-z0-9]+$")  # intermediate streams such as "name.f137.mp4"
-YT_FINAL = ("private video", "has been removed", "been terminated", "copyright", "members-only", "members only", "join this channel", "live event will begin", "premieres in", "unsupported url", "is not a valid url", "video has been deleted")
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 
@@ -244,10 +238,7 @@ def clean_error(e: BaseException) -> str:
         msg = ("the site didn't return a playable file. The post may be private, deleted or restricted, "
                "or the site is temporarily blocking the server. Please try again in a moment.")
     low = msg.lower()
-    if "sign in to confirm" in low and "bot" in low:
-        msg = ("YouTube is refusing this server's connection right now (it asked to confirm the visitor is not a bot). "
-               "Please try again in a few minutes.")
-    elif "this content isn't available to everyone" in low or "this content is not available to everyone" in low:
+    if "this content isn't available to everyone" in low or "this content is not available to everyone" in low:
         msg = ("Instagram restricts this post to certain audiences. If the post is visible in your own Instagram account, "
                "configure a valid COOKIES_TXT value on the backend using cookies from an account authorized to view it, "
                "then redeploy. If that account cannot view the post, Toolora cannot download it.")
@@ -778,29 +769,9 @@ def attempts_for(mode: str, url: str) -> list[dict]:
         if mode == "video":
             out.append(formats[-1])
         return out
-    if not is_youtube(url):
-        if mode == "video":  # TikTok / X / others serve ready-made MP4s: take one, skip the slow audio+video merge
-            return [{"format": "b[ext=mp4]/bv*+ba/b", "format_sort": SORT}] + formats[1:]
-        return formats
-
-    # YouTube's extractor changes frequently, so try each client once with one format chain (fast failures).
-    if mode == "audio":
-        chain = [formats[0]]
-        tiers = []
-    else:
-        chain = [{"format": "bv*+ba/b", "format_sort": YT_SORT}]  # best up to 1080p, H.264 + AAC, so it plays everywhere and stays under the size cap
-        tiers = [{"format": "bv*[height<=720]+ba/b[height<=720]", "format_sort": YT_SORT, "_lower": True},
-                 {"format": "bv*[height<=480]+ba/b[height<=480]", "format_sort": YT_SORT, "_lower": True},
-                 {"format": "best", "_lower": True}]
-    # Clients that need no JavaScript challenge solving go first: they answer in a second or two even on a small
-    # server, while the web clients can take a minute there. yt-dlp's own default mix goes last as the catch-all.
-    clients = ["android_vr", "visionos", "tv", "web_safari", "mweb", "web_embedded", "ios", "android", "tv_simply", "web"]
-    out = []
-    for client in clients:
-        out.append({**chain[0], "extractor_args": {"youtube": {"player_client": [client]}}, "remote_components": ["ejs:github"]})
-    out.append({**chain[0], "remote_components": ["ejs:github"]})
-    out.extend({**t, "remote_components": ["ejs:github"]} for t in tiers)  # smaller versions, used if the big one is over the size cap
-    return out
+    if mode == "video":  # TikTok / X / others serve ready-made MP4s: take one, skip the slow audio+video merge
+        return [{"format": "b[ext=mp4]/bv*+ba/b", "format_sort": SORT}] + formats[1:]
+    return formats
 
 
 def pick_file(folder: str, mode: str) -> str | None:
@@ -868,8 +839,7 @@ RAPIDAPI_HOST = os.getenv("RAPIDAPI_HOST", "youtube-mp3-audio-video-downloader.p
 RAPIDAPI_QUALITY = os.getenv("RAPIDAPI_MP3_QUALITY", "low").strip()
 RAPIDAPI_DAILY = int(os.getenv("RAPIDAPI_DAILY_LIMIT", "200"))
 _rapid_used: dict[str, int] = {}
-RAPIDAPI_DEBUG = os.getenv("RAPIDAPI_DEBUG", "").strip() == "1"  # show why RapidAPI failed in the error message (for testing)
-RAPID_NOTES: dict[str, str] = {}
+RAPIDAPI_HIDE_ERRORS = os.getenv("RAPIDAPI_HIDE_ERRORS", "").strip() == "1"  # 1 = hide the technical reason from visitors
 
 
 def yt_video_id(url: str) -> str:
@@ -1007,7 +977,6 @@ def rapid_audio(url: str, folder: str) -> str:
 
 
 RAPIDAPI_VIDEO_HOST = os.getenv("RAPIDAPI_VIDEO_HOST", "youtube-media-downloader.p.rapidapi.com").strip()
-RAPIDAPI_VIDEO_ON = os.getenv("RAPIDAPI_VIDEO", "1").strip() != "0"
 RAPIDAPI_VIDEO_DAILY = int(os.getenv("RAPIDAPI_VIDEO_DAILY_LIMIT", "100"))
 
 
@@ -1064,25 +1033,35 @@ def rapid_video(url: str, folder: str) -> str:
     return out
 
 
+def fetch_youtube(url: str, folder: str, mode: str) -> str:
+    """YouTube goes only through RapidAPI. There is no yt-dlp fallback for YouTube."""
+    if not RAPIDAPI_KEY:
+        raise RuntimeError("YouTube downloads are not set up on this server yet (the RAPIDAPI_KEY setting is missing).")
+    try:
+        return rapid_audio(url, folder) if mode == "audio" else rapid_video(url, folder)
+    except Exception as e:
+        detail = re.sub(r"\s+", " ", ANSI.sub("", str(e))).strip()
+        print(f"[toolora] rapidapi {mode} failed {url[:120]}: {detail[:400]}", flush=True)
+        clear_folder(folder)
+        low = detail.lower()
+        if "daily" in low and "limit" in low or "http 429" in low:
+            msg = "YouTube downloads have reached today's limit. Please try again later."
+        elif "http 401" in low or "http 403" in low:
+            msg = "YouTube downloads are temporarily unavailable because the download service refused the request."
+        elif "larger than" in low:
+            msg = f"that video is larger than the {MAX_MB} MB limit."
+        else:
+            msg = "the YouTube download service could not fetch this video. Please try again in a moment."
+        if not RAPIDAPI_HIDE_ERRORS and detail:
+            msg += f" [{detail[:180]}]"
+        raise RuntimeError(msg)
+
+
 def fetch(url: str, folder: str, mode: str = "video") -> str:
     orig = url.strip()
     url = normalize_url(url)
-    if not RAPIDAPI_KEY and is_youtube(url) and mode in ("audio", "video"):
-        RAPID_NOTES[folder] = "RapidAPI is not used: the RAPIDAPI_KEY setting is empty on this server"
-    if mode == "video" and RAPIDAPI_KEY and RAPIDAPI_VIDEO_ON and is_youtube(url):
-        try:
-            return rapid_video(url, folder)
-        except Exception as e:
-            print(f"[toolora] rapidapi video failed, using yt-dlp: {ANSI.sub('', str(e))[:300]}", flush=True)
-            RAPID_NOTES[folder] = f"RapidAPI video: {ANSI.sub('', str(e))[:180]}"
-            clear_folder(folder)
-    if mode == "audio" and RAPIDAPI_KEY and is_youtube(url):
-        try:
-            return rapid_audio(url, folder)
-        except Exception as e:
-            print(f"[toolora] rapidapi audio failed, using yt-dlp: {ANSI.sub('', str(e))[:300]}", flush=True)
-            RAPID_NOTES[folder] = f"RapidAPI audio: {ANSI.sub('', str(e))[:180]}"
-            clear_folder(folder)
+    if is_youtube(url):
+        return fetch_youtube(url, folder, mode)  # YouTube is served only by RapidAPI
     if is_snapchat(url):
         url = snap_resolve(url)
     base = {
@@ -1098,12 +1077,8 @@ def fetch(url: str, folder: str, mode: str = "video") -> str:
         "fragment_retries": 3,
         "remote_components": ["ejs:github"],
     }
-    if is_youtube(url) and YT_PROXY:
-        base["proxy"] = YT_PROXY
-    elif OUT_PROXY:
+    if OUT_PROXY:
         base["proxy"] = OUT_PROXY
-    if is_youtube(url):
-        base.update({"retries": 1, "fragment_retries": 2, "socket_timeout": 15})
     cookie_path = None
     if COOKIES:
         fd, cookie_path = tempfile.mkstemp(prefix="ck_", suffix=".txt")  # yt-dlp rewrites its cookie file, so give it a private copy
@@ -1131,8 +1106,6 @@ def fetch(url: str, folder: str, mode: str = "video") -> str:
                 break  # stop trying new methods; the visitor gets the last reason instead of an endless spinner
             lower = bool(extra.get("_lower"))
             extra = {k: v for k, v in extra.items() if k != "_lower"}
-            if capped and not lower and is_youtube(url):
-                continue  # too big: jump straight to the smaller versions
             if lower and not capped and "requested format" not in str(last or "").lower():
                 continue  # smaller versions only help with size or format problems, not with blocks
             clear_folder(folder)
@@ -1148,14 +1121,6 @@ def fetch(url: str, folder: str, mode: str = "video") -> str:
                 if not isinstance(e, yt_dlp.utils.DownloadError):
                     raise
                 msg = str(e).lower()
-                if is_youtube(url):
-                    if any(x in msg for x in YT_FINAL):
-                        raise  # private / removed / copyright: no other client can help
-                    if "sign in to confirm" in msg or "not a bot" in msg:
-                        blocked += 1
-                        if blocked >= 4:
-                            raise  # YouTube is blocking this server's address; more clients won't change that
-                    continue
                 if mode == "audio" or "requested format" not in msg:
                     raise
                 continue
@@ -1260,13 +1225,9 @@ async def download(req: Req, request: Request):
         shutil.rmtree(folder, ignore_errors=True)
         print(f"[toolora] download failed ({req.mode}) {link[:120]}: {ANSI.sub('', str(e))[:600]}", flush=True)
         reason = clean_error(e)
-        note = RAPID_NOTES.pop(folder, "")
-        if RAPIDAPI_DEBUG and note:
-            reason += f" [{note}]"
         what = "extract the audio from" if req.mode == "audio" else "download"
         target = "that media" if is_pinterest(link) else "that video"
         raise HTTPException(422, f"Couldn't {what} {target}: {reason}")
-    RAPID_NOTES.pop(folder, None)
     ext = os.path.splitext(path)[1].lower()
     media = {".mp3": "audio/mpeg", ".mp4": "video/mp4", ".webm": "video/webm", ".mkv": "video/x-matroska", ".mov": "video/quicktime", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp"}.get(ext, "application/octet-stream")
     return FileResponse(path, media_type=media, filename=os.path.basename(path), background=cleanup)
