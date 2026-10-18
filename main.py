@@ -870,8 +870,17 @@ def _rapid_quota_ok(bucket: str = "audio", limit: int | None = None) -> bool:
 
 def _rapid_json(path: str, timeout: int = 75, host: str | None = None):
     host = host or RAPIDAPI_HOST
-    req = urllib.request.Request("https://" + host + path,
-                                 headers={"x-rapidapi-key": RAPIDAPI_KEY, "x-rapidapi-host": host, "Accept": "application/json"})
+    req = urllib.request.Request(
+        "https://" + host + path,
+        headers={
+            "x-rapidapi-key": RAPIDAPI_KEY,
+            "x-rapidapi-host": host,
+            "Accept": "application/json",
+            "User-Agent": UA,
+            "Accept-Language": "en-US,en;q=0.9",
+            "Cache-Control": "no-cache",
+        },
+    )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read().decode("utf-8", "replace"))
@@ -1165,7 +1174,8 @@ def fetch_youtube(url: str, folder: str, mode: str) -> str:
         return _youtube_ytdlp_fallback(url, folder, mode)
     except Exception as fallback_error:
         detail = f"RapidAPI: {rapid_error}; fallback: {re.sub(r'\s+', ' ', ANSI.sub('', str(fallback_error))).strip()}"
-        print(f"[toolora] YouTube fallback failed {url[:120]}: {detail[:500]}", flush=True)
+        # Keep the full provider/fallback reason in Render logs for diagnosis.
+        print(f"[toolora] YouTube fallback failed {url[:120]}: {detail[:1500]}", flush=True)
         clear_folder(folder)
         low = detail.lower()
         if ("daily" in low and "limit" in low) or "http 429" in low:
@@ -1174,8 +1184,10 @@ def fetch_youtube(url: str, folder: str, mode: str) -> str:
             msg = f"that video is larger than the {MAX_MB} MB limit."
         else:
             msg = "YouTube could not be downloaded through either available service. Please try again later."
+        if "error 1010" in low or "access denied" in low:
+            msg = "The YouTube API provider is blocking requests from the backend (Cloudflare Error 1010). The API works in its playground, but the provider must allow backend requests or provide a supported endpoint."
         if not RAPIDAPI_HIDE_ERRORS:
-            msg += f" [{detail[:180]}]"
+            msg += f" [{detail[:420]}]"
         raise RuntimeError(msg)
 
 
