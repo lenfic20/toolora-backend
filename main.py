@@ -871,7 +871,7 @@ def _rapid_quota_ok(bucket: str = "audio", limit: int | None = None) -> bool:
 def _rapid_json(path: str, timeout: int = 75, host: str | None = None):
     host = host or RAPIDAPI_HOST
     req = urllib.request.Request("https://" + host + path,
-                                 headers={"x-rapidapi-key": RAPIDAPI_KEY, "x-rapidapi-host": host, "Accept": "application/json"})
+                                 headers={"x-rapidapi-key": RAPIDAPI_KEY, "x-rapidapi-host": host, "Accept": "application/json", "User-Agent": UA})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read().decode("utf-8", "replace"))
