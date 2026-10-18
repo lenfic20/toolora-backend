@@ -14,7 +14,8 @@ Env vars (all optional):
   PROXY_SECRET      shared secret sent by the Toolora worker; when set, /download only accepts requests that carry it
   RAPIDAPI_KEY      RapidAPI key. YouTube downloads (MP3 and video) use RapidAPI only; yt-dlp serves the other platforms.
                     Also: RAPIDAPI_HOST, RAPIDAPI_MP3_QUALITY (default low), RAPIDAPI_DAILY_LIMIT (default 200),
-                    RAPIDAPI_VIDEO_HOST, RAPIDAPI_VIDEO_DAILY_LIMIT (default 100), RAPIDAPI_HIDE_ERRORS=1 (hide technical reasons).
+                    RAPIDAPI_VIDEO_HOST, RAPIDAPI_VIDEO_DAILY_LIMIT (default 100), RAPIDAPI_HIDE_ERRORS=1 (hide technical reasons),
+                    RAPIDAPI_TEST_TOKEN (turns on the owner-only /rapid-test check).
   COOKIES_TXT       (optional) browser cookies in Netscape cookies.txt format. Lets Instagram serve the server
                     like a logged-in browser, which fixes "login required" blocks.
                     Alternatives: COOKIES_B64 (the same file, base64-encoded) or a Render Secret File named cookies.txt
@@ -991,61 +992,118 @@ def rapid_audio(url: str, folder: str) -> str:
     return out
 
 
-RAPIDAPI_VIDEO_HOST = os.getenv("RAPIDAPI_VIDEO_HOST", "youtube-media-downloader.p.rapidapi.com").strip()
+RAPIDAPI_VIDEO_HOST = os.getenv("RAPIDAPI_VIDEO_HOST", "youtube-video-and-shorts-downloader.p.rapidapi.com").strip()
 RAPIDAPI_VIDEO_DAILY = int(os.getenv("RAPIDAPI_VIDEO_DAILY_LIMIT", "100"))
+_URL_KEYS = ("url", "link", "src", "download", "downloadUrl", "download_url", "file", "stream", "streamUrl")
 
 
 def _height(it: dict) -> int:
-    for k in ("height", "quality", "qualityLabel", "label"):
+    for k in ("height", "quality", "qualityLabel", "label", "resolution", "format_note", "formatNote"):
         m = re.search(r"(\d{3,4})", str(it.get(k) or ""))
         if m:
             return int(m.group(1))
     return 0
 
 
-def _is_mp4(it: dict) -> bool:
-    return "mp4" in (str(it.get("extension") or "") + str(it.get("mimeType") or it.get("mime") or "")).lower() or not (it.get("extension") or it.get("mimeType") or it.get("mime"))
+def _collect_streams(obj, out: list, in_list: bool = False) -> None:
+    """The service's JSON layout is not documented, so gather every object that carries a file link."""
+    if isinstance(obj, dict):
+        u = next((obj[k] for k in _URL_KEYS if isinstance(obj.get(k), str) and obj[k].startswith("http")), None)
+        if u:
+            out.append((u, obj))
+        for v in obj.values():
+            if isinstance(v, (dict, list)):
+                _collect_streams(v, out)
+    elif isinstance(obj, list):
+        for v in obj:
+            if isinstance(v, str) and v.startswith("http"):
+                out.append((v, {}))
+            else:
+                _collect_streams(v, out, True)
 
 
-def _items(block) -> list:
-    if isinstance(block, dict):
-        block = block.get("items") or block.get("list") or []
-    return [x for x in block if isinstance(x, dict) and isinstance(x.get("url"), str) and x["url"].startswith("http")] if isinstance(block, list) else []
+def _describe(u: str, it: dict) -> dict:
+    q = parse_qs(urlparse(u).query)
+    mime = str(it.get("mimeType") or it.get("mime") or it.get("mime_type") or it.get("type") or (q.get("mime") or [""])[0]).lower()
+    ext = str(it.get("ext") or it.get("extension") or it.get("container") or "").lower().lstrip(".")
+    if not ext:
+        ext = (re.search(r"\.([a-z0-9]{2,4})(?:[?#]|$)", urlparse(u).path.lower()) or [None, ""])[1]
+    if not ext and "/" in mime:
+        ext = mime.split("/")[1].split(";")[0]
+    audio_only = ("audio" in mime and "video" not in mime) or ext in ("m4a", "mp3", "opus", "aac") or str(it.get("vcodec") or "").lower() == "none"
+    img = ext in ("jpg", "jpeg", "png", "webp", "gif") or "ytimg.com" in u
+    has_audio = None
+    for k in ("hasAudio", "has_audio", "audio", "withAudio"):
+        if isinstance(it.get(k), bool):
+            has_audio = it[k]
+    if has_audio is None and str(it.get("acodec") or "").lower() == "none":
+        has_audio = False
+    size = it.get("size") or it.get("contentLength") or it.get("filesize") or (q.get("clen") or [None])[0]
+    try:
+        size = int(size) if size is not None else None
+    except (TypeError, ValueError):
+        size = None
+    return {"url": u, "host": urlparse(u).hostname or "", "height": _height(it), "ext": ext, "mime": mime, "audio_only": audio_only,
+            "image": img, "has_audio": has_audio, "size": size}
+
+
+def _video_candidates(data) -> tuple[list, list]:
+    found: list = []
+    _collect_streams(data, found)
+    seen, items = set(), []
+    for u, it in found:
+        if u in seen:
+            continue
+        seen.add(u)
+        items.append(_describe(u, it))
+    cap = MAX_MB * 1024 * 1024
+    vids = [d for d in items if not d["audio_only"] and not d["image"] and d["ext"] in ("mp4", "", "m4v", "mov")
+            and d["height"] <= 1080 and (d["size"] is None or d["size"] <= cap)]
+    # muxed files first (sound included or unknown), then the sharpest
+    vids.sort(key=lambda d: (d["has_audio"] is not False, d["height"]), reverse=True)
+    auds = [d for d in items if d["audio_only"] and d["ext"] in ("m4a", "mp4", "aac", "mp3")]
+    return vids, auds
+
+
+def _video_json(vid: str):
+    return _rapid_json(f"/download.php?id={quote(vid)}", host=RAPIDAPI_VIDEO_HOST)
 
 
 def rapid_video(url: str, folder: str) -> str:
     if not _rapid_quota_ok("video", RAPIDAPI_VIDEO_DAILY):
         raise RuntimeError("daily RapidAPI video limit reached")
     vid = yt_video_id(url)
-    data = _rapid_json(f"/v2/video/details?videoId={vid}&urlAccess=normal&videos=auto&audios=auto", host=RAPIDAPI_VIDEO_HOST)
-    if not isinstance(data, dict):
-        raise RuntimeError("unexpected RapidAPI answer")
-    if data.get("status") is False:
-        raise RuntimeError("RapidAPI: " + str(data.get("errorId") or data.get("reason") or data)[:200])
-    cap = MAX_MB * 1024 * 1024
-    vids = [v for v in _items(data.get("videos")) if _is_mp4(v) and 0 < _height(v) <= 1080 and (not isinstance(v.get("size"), (int, float)) or v["size"] <= cap)]
-    auds = [a for a in _items(data.get("audios")) if "webm" not in str(a.get("extension") or a.get("mimeType") or "").lower() and "opus" not in str(a.get("mimeType") or "").lower()]
+    data = _video_json(vid)
+    if isinstance(data, dict) and (data.get("error") or data.get("success") is False or data.get("status") is False):
+        raise RuntimeError("RapidAPI: " + json.dumps(data)[:200])
+    vids, auds = _video_candidates(data)
     if not vids:
         raise RuntimeError("RapidAPI returned no usable video: " + json.dumps(data)[:200])
-    pick = max(vids, key=lambda v: (_height(v), v.get("hasAudio") is True))  # sharpest first; a merge adds the sound if it is missing
-    title = str(data.get("title") or "")
+    title = str(data.get("title") or "") if isinstance(data, dict) else ""
     stem = re.sub(r"[^A-Za-z0-9._-]+", "_", title).strip("._")[:80] or "YouTube"
     out = os.path.join(folder, f"{stem}_{vid}.mp4")
-    if pick.get("hasAudio") is True or not auds:
-        _save_file(pick["url"], out)
-        return out
-    vpath, apath = os.path.join(folder, "v.part.mp4"), os.path.join(folder, "a.part.m4a")
-    _save_file(pick["url"], vpath)
-    _save_file(max(auds, key=lambda a: a.get("bitrate") or a.get("size") or 0)["url"], apath)
-    r = subprocess.run(["ffmpeg", "-y", "-i", vpath, "-i", apath, "-c", "copy", "-movflags", "+faststart", out], capture_output=True, timeout=150)
-    if r.returncode != 0 or not os.path.exists(out) or os.path.getsize(out) < 10_000:
-        raise RuntimeError("could not join the video and audio")
-    for p in (vpath, apath):
+    errors = []
+    for pick in vids[:3]:
         try:
-            os.remove(p)
-        except OSError:
-            pass
-    return out
+            if pick["has_audio"] is False and auds:
+                vpath, apath = os.path.join(folder, "v.part.mp4"), os.path.join(folder, "a.part.m4a")
+                _save_file(pick["url"], vpath)
+                _save_file(auds[0]["url"], apath)
+                r = subprocess.run(["ffmpeg", "-y", "-i", vpath, "-i", apath, "-c", "copy", "-movflags", "+faststart", out], capture_output=True, timeout=150)
+                if r.returncode != 0 or not os.path.exists(out) or os.path.getsize(out) < 10_000:
+                    raise RuntimeError("could not join the video and audio")
+                for p in (vpath, apath):
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
+            else:
+                _save_file(pick["url"], out)
+            return out
+        except Exception as e:
+            errors.append(str(e)[:120])
+            clear_folder(folder)
+    raise RuntimeError("; ".join(errors))
 
 
 def fetch_youtube(url: str, folder: str, mode: str) -> str:
@@ -1187,6 +1245,44 @@ def fetch(url: str, folder: str, mode: str = "video") -> str:
 @app.get("/health")
 def health():
     return {"ok": True}
+
+
+
+@app.get("/rapid-test")
+def rapid_test(id: str = "dQw4w9WgXcQ", token: str = "", kind: str = "video"):
+    """Owner-only check of the RapidAPI services. Works only when RAPIDAPI_TEST_TOKEN is set on the server."""
+    expected = os.getenv("RAPIDAPI_TEST_TOKEN", "")
+    if not expected or not hmac.compare_digest(token.encode(), expected.encode()):
+        raise HTTPException(404, "Not found")
+    if not RAPIDAPI_KEY:
+        return JSONResponse({"ok": False, "problem": "RAPIDAPI_KEY is empty on this server"})
+    try:
+        vid = yt_video_id("https://youtu.be/" + id) if len(id) == 11 else yt_video_id(id)
+        if kind == "mp3":
+            data = _rapid_json(f"/get_mp3_download_link/{vid}?quality={quote(RAPIDAPI_QUALITY)}&wait_until_the_file_is_ready=true")
+            link = _find_link(data)
+            cands = [_describe(link, {})] if link else []
+        else:
+            data = _video_json(vid)
+            vids, auds = _video_candidates(data)
+            cands = vids[:4] + auds[:1]
+    except Exception as e:
+        return JSONResponse({"ok": False, "problem": str(e)[:300]})
+    report = []
+    for d in cands:
+        row = {k: d[k] for k in ("host", "height", "ext", "mime", "has_audio", "size")}
+        try:
+            req = urllib.request.Request(d["url"], headers={"User-Agent": UA, "Range": "bytes=0-1"})
+            with urllib.request.urlopen(req, timeout=25) as r:
+                row["fetch_from_this_server"] = f"OK (HTTP {r.status})"
+        except urllib.error.HTTPError as e:
+            row["fetch_from_this_server"] = f"REFUSED (HTTP {e.code})"
+        except Exception as e:
+            row["fetch_from_this_server"] = "ERROR " + str(e)[:80]
+        report.append(row)
+    keys = list(data.keys())[:20] if isinstance(data, dict) else type(data).__name__
+    return JSONResponse({"ok": True, "kind": kind, "top_level_keys": keys, "candidates": report,
+                         "preview": re.sub(r"https?://[^\"\s]+", "<link>", json.dumps(data))[:700]})
 
 
 @app.post("/download")
