@@ -1074,8 +1074,15 @@ def rapid_video(url: str, folder: str) -> str:
         raise RuntimeError("daily RapidAPI video limit reached")
     vid = yt_video_id(url)
     data = _video_json(vid)
-    if isinstance(data, dict) and (data.get("error") or data.get("success") is False or data.get("status") is False):
-        raise RuntimeError("RapidAPI: " + json.dumps(data)[:200])
+    if isinstance(data, dict) and (
+        data.get("error")
+        or data.get("success") is False
+        or data.get("status") is False
+        or str(data.get("status", "")).strip().lower() == "error"
+        or (isinstance(data.get("status_code"), int) and data["status_code"] >= 400)
+    ):
+        message = data.get("message") or data.get("error") or "API returned an error"
+        raise RuntimeError(f"RapidAPI: {message}")
     vids, auds = _video_candidates(data)
     if not vids:
         raise RuntimeError("RapidAPI returned no usable video: " + json.dumps(data)[:200])
@@ -1106,26 +1113,68 @@ def rapid_video(url: str, folder: str) -> str:
     raise RuntimeError("; ".join(errors))
 
 
+def _youtube_ytdlp_fallback(url: str, folder: str, mode: str) -> str:
+    """Fallback for temporary RapidAPI/provider blocks; keep YouTube isolated from other site flows."""
+    options = {
+        "outtmpl": os.path.join(folder, "%(title).80B [%(id)s].%(ext)s"),
+        "noplaylist": True,
+        "restrictfilenames": True,
+        "max_filesize": MAX_MB * 1024 * 1024,
+        "socket_timeout": 20,
+        "quiet": True,
+        "no_warnings": True,
+        "retries": 2,
+        "fragment_retries": 2,
+        "merge_output_format": "mp4",
+        "remote_components": ["ejs:github"],
+    }
+    if OUT_PROXY:
+        options["proxy"] = OUT_PROXY
+    if mode == "audio":
+        options["format"] = "bestaudio/best"
+        options["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}]
+    else:
+        options["format"] = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+    before = set(os.listdir(folder))
+    with yt_dlp.YoutubeDL(options) as ydl:
+        ydl.download([url])
+    created = [os.path.join(folder, name) for name in os.listdir(folder) if name not in before and os.path.isfile(os.path.join(folder, name))]
+    valid = [path for path in created if os.path.getsize(path) > 10_000 and not path.endswith((".part", ".ytdl"))]
+    if not valid:
+        # yt-dlp may replace an intermediate filename during post-processing.
+        valid = [os.path.join(folder, name) for name in os.listdir(folder) if os.path.isfile(os.path.join(folder, name)) and os.path.getsize(os.path.join(folder, name)) > 10_000 and not name.endswith((".part", ".ytdl"))]
+    if not valid:
+        raise RuntimeError("YouTube fallback finished without producing a media file")
+    return max(valid, key=os.path.getsize)
+
+
 def fetch_youtube(url: str, folder: str, mode: str) -> str:
-    """YouTube goes only through RapidAPI. There is no yt-dlp fallback for YouTube."""
-    if not RAPIDAPI_KEY:
-        raise RuntimeError("YouTube downloads are not set up on this server yet (the RAPIDAPI_KEY setting is missing).")
+    """Try RapidAPI first, then yt-dlp if the API is blocked or returns an unusable response."""
+    rapid_error = None
+    if RAPIDAPI_KEY:
+        try:
+            return rapid_audio(url, folder) if mode == "audio" else rapid_video(url, folder)
+        except Exception as e:
+            rapid_error = re.sub(r"\s+", " ", ANSI.sub("", str(e))).strip()
+            print(f"[toolora] rapidapi {mode} failed {url[:120]}: {rapid_error[:400]}", flush=True)
+            clear_folder(folder)
+    else:
+        rapid_error = "RAPIDAPI_KEY is not configured"
+
     try:
-        return rapid_audio(url, folder) if mode == "audio" else rapid_video(url, folder)
-    except Exception as e:
-        detail = re.sub(r"\s+", " ", ANSI.sub("", str(e))).strip()
-        print(f"[toolora] rapidapi {mode} failed {url[:120]}: {detail[:400]}", flush=True)
+        return _youtube_ytdlp_fallback(url, folder, mode)
+    except Exception as fallback_error:
+        detail = f"RapidAPI: {rapid_error}; fallback: {re.sub(r'\s+', ' ', ANSI.sub('', str(fallback_error))).strip()}"
+        print(f"[toolora] YouTube fallback failed {url[:120]}: {detail[:500]}", flush=True)
         clear_folder(folder)
         low = detail.lower()
-        if "daily" in low and "limit" in low or "http 429" in low:
+        if ("daily" in low and "limit" in low) or "http 429" in low:
             msg = "YouTube downloads have reached today's limit. Please try again later."
-        elif "http 401" in low or "http 403" in low:
-            msg = "YouTube downloads are temporarily unavailable because the download service refused the request."
         elif "larger than" in low:
             msg = f"that video is larger than the {MAX_MB} MB limit."
         else:
-            msg = "the YouTube download service could not fetch this video. Please try again in a moment."
-        if not RAPIDAPI_HIDE_ERRORS and detail:
+            msg = "YouTube could not be downloaded through either available service. Please try again later."
+        if not RAPIDAPI_HIDE_ERRORS:
             msg += f" [{detail[:180]}]"
         raise RuntimeError(msg)
 
