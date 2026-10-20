@@ -1078,6 +1078,7 @@ RAPIDAPI_FAST_MAX_HEIGHT = int(os.getenv("RAPIDAPI_FAST_MAX_HEIGHT", "720"))
 def _save_when_ready(u: str, path: str, wait: int = 100) -> None:
     """The fast service prepares the file on its own server; the link answers 404 until it is ready."""
     deadline = time.monotonic() + wait
+    time.sleep(5)  # give the service 5 seconds to prepare the file, then fetch it
     while True:
         try:
             _save_file(u, path, once=True)  # one quick check per round instead of six slow retries
