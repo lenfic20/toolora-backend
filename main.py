@@ -1368,7 +1368,7 @@ def _fetch_youtube_social(url: str, folder: str, mode: str, quality: str | None 
 
 
 def fetch_youtube(url: str, folder: str, mode: str, quality: str | None = None) -> str:
-    """YouTube downloads use the Social Download All-in-One RapidAPI endpoint."""
+    """Use Social Download All-in-One first; fall back when its Google CDN link is IP-locked (HTTP 403)."""
     if not RAPIDAPI_KEY:
         raise RuntimeError("YouTube downloads are not available right now (RAPIDAPI_KEY is not configured).")
     try:
@@ -1378,6 +1378,21 @@ def fetch_youtube(url: str, folder: str, mode: str, quality: str | None = None) 
         print(f"[toolora] social rapidapi {mode} failed {url[:120]}: {detail[:500]}", flush=True)
         clear_folder(folder)
         low = detail.lower()
+        # YouTube media URLs can be signed for the API provider's IP. Fetching them from
+        # our backend then returns 403 from redirector.googlevideo.com. Use the existing
+        # API-side file preparation service instead, whose download links are not IP-locked.
+        if mode == "video" and not quality and ("403" in low or "googlevideo.com" in low or "could not fetch the media file" in low):
+            try:
+                return rapid_video_fast(url, yt_video_id(url), folder)
+            except Exception as fallback_error:
+                print(f"[toolora] youtube fast fallback failed {url[:120]}: {str(fallback_error)[:300]}", flush=True)
+                clear_folder(folder)
+        elif mode == "audio" and ("403" in low or "googlevideo.com" in low or "could not fetch the media file" in low):
+            try:
+                return rapid_audio(url, folder)
+            except Exception as fallback_error:
+                print(f"[toolora] youtube audio fallback failed {url[:120]}: {str(fallback_error)[:300]}", flush=True)
+                clear_folder(folder)
         if ("daily" in low and "limit" in low) or "http 429" in low:
             msg = "YouTube downloads have reached today's limit. Please try again later."
         elif "larger than" in low:
