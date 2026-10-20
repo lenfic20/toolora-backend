@@ -83,6 +83,7 @@ def check_rate(ip: str, bucket=None, limit: int | None = None) -> None:
 class Req(BaseModel):
     url: str
     mode: Literal["video", "audio", "info", "file"] = "video"
+    quality: str | None = None
 
 
 def valid_url(u: str) -> bool:
@@ -1072,7 +1073,7 @@ def _video_json(vid: str):
 
 
 RAPIDAPI_FAST_HOST = os.getenv("RAPIDAPI_FAST_VIDEO_HOST", "youtube-video-fast-downloader-24-7.p.rapidapi.com").strip()
-RAPIDAPI_FAST_MAX_HEIGHT = int(os.getenv("RAPIDAPI_FAST_MAX_HEIGHT", "720"))
+RAPIDAPI_FAST_MAX_HEIGHT = int(os.getenv("RAPIDAPI_FAST_MAX_HEIGHT", "1080"))
 
 
 def _save_when_ready(u: str, path: str, wait: int = 100) -> None:
@@ -1092,7 +1093,7 @@ def _save_when_ready(u: str, path: str, wait: int = 100) -> None:
             time.sleep(1.5)
 
 
-def rapid_video_fast(url: str, vid: str, folder: str) -> str:
+def rapid_video_fast(url: str, vid: str, folder: str, quality: str | None = None) -> str:
     """Video from youtube-video-fast-downloader-24-7. Its file links live on the API's own server,
     so they are not locked to the API's IP like raw googlevideo.com links (those give HTTP 403 from Render)."""
     opts = _rapid_json(f"/get_available_quality/{quote(vid)}", host=RAPIDAPI_FAST_HOST)
@@ -1116,9 +1117,13 @@ def rapid_video_fast(url: str, vid: str, folder: str) -> str:
     if not cands:
         raise RuntimeError("RapidAPI fast video: no usable quality " + json.dumps(items)[:160])
     cands.sort(key=lambda c: (c[0], c[1]), reverse=True)
+    if quality:
+        cands = [c for c in cands if str(c[2].get("id")) == str(quality)]
+        if not cands:
+            raise RuntimeError("The selected YouTube quality is no longer available. Fetch qualities again.")
     kind = "download_short" if "/shorts/" in url.lower() else "download_video"
     errors = []
-    for mp4, h, it in cands[:2]:
+    for mp4, h, it in cands[:1] if quality else cands[:2]:
         try:
             data = _rapid_json(f"/{kind}/{quote(vid)}?quality={quote(str(it['id']))}", host=RAPIDAPI_FAST_HOST)
             link = data.get("file") if isinstance(data, dict) else None
@@ -1138,16 +1143,18 @@ def rapid_video_fast(url: str, vid: str, folder: str) -> str:
     raise RuntimeError("fast video: " + "; ".join(errors))
 
 
-def rapid_video(url: str, folder: str) -> str:
+def rapid_video(url: str, folder: str, quality: str | None = None) -> str:
     if not _rapid_quota_ok("video", RAPIDAPI_VIDEO_DAILY):
         raise RuntimeError("daily RapidAPI video limit reached")
     vid = yt_video_id(url)
     try:
-        return rapid_video_fast(url, vid, folder)
+        return rapid_video_fast(url, vid, folder, quality)
     except Exception as e:
         first = str(e)[:200]
         print(f"[toolora] rapidapi fast video failed {vid}: {first}", flush=True)
         clear_folder(folder)
+        if quality:
+            raise RuntimeError(first)
     try:
         return _rapid_video_raw(vid, folder)
     except Exception as e:
@@ -1196,12 +1203,34 @@ def _rapid_video_raw(vid: str, folder: str) -> str:
     raise RuntimeError("; ".join(errors))
 
 
-def fetch_youtube(url: str, folder: str, mode: str) -> str:
+def youtube_available_qualities(url: str) -> list[dict]:
+    """Return the available video qualities quickly, without preparing/downloading media."""
+    vid = yt_video_id(url)
+    data = _rapid_json(f"/get_available_quality/{quote(vid)}", host=RAPIDAPI_FAST_HOST)
+    items = data if isinstance(data, list) else next((v for v in data.values() if isinstance(v, list)), []) if isinstance(data, dict) else []
+    out, seen = [], set()
+    cap = MAX_MB * 1024 * 1024
+    for it in items:
+        if not isinstance(it, dict) or str(it.get("type", "video")).lower() != "video" or it.get("id") is None:
+            continue
+        h = _height(it)
+        try: size = int(str(it.get("size") or 0).strip('"\\ ') or 0)
+        except (TypeError, ValueError): size = 0
+        if h <= 0 or (size and size > cap): continue
+        key = str(it["id"])
+        if key in seen: continue
+        seen.add(key)
+        out.append({"id": key, "height": h, "label": f"{h}p" + (" (MP4)" if "mp4" in str(it.get("mime") or "").lower() else "")})
+    out.sort(key=lambda x: x["height"], reverse=True)
+    return out
+
+
+def fetch_youtube(url: str, folder: str, mode: str, quality: str | None = None) -> str:
     """YouTube is served only by RapidAPI (no yt-dlp)."""
     if not RAPIDAPI_KEY:
         raise RuntimeError("YouTube downloads are not available right now (RAPIDAPI_KEY is not configured).")
     try:
-        return rapid_audio(url, folder) if mode == "audio" else rapid_video(url, folder)
+        return rapid_audio(url, folder) if mode == "audio" else rapid_video(url, folder, quality)
     except Exception as e:
         detail = re.sub(r"\s+", " ", ANSI.sub("", str(e))).strip()
         print(f"[toolora] rapidapi {mode} failed {url[:120]}: {detail[:500]}", flush=True)
@@ -1218,11 +1247,11 @@ def fetch_youtube(url: str, folder: str, mode: str) -> str:
         raise RuntimeError(msg)
 
 
-def fetch(url: str, folder: str, mode: str = "video") -> str:
+def fetch(url: str, folder: str, mode: str = "video", quality: str | None = None) -> str:
     orig = url.strip()
     url = normalize_url(url)
     if is_youtube(url):
-        return fetch_youtube(url, folder, mode)  # YouTube is served only by RapidAPI
+        return fetch_youtube(url, folder, mode, quality)  # YouTube is served only by RapidAPI
     if is_snapchat(url):
         url = snap_resolve(url)
     base = {
@@ -1404,6 +1433,16 @@ async def download(req: Req, request: Request):
     if not valid_url(link):
         raise HTTPException(400, "Paste a link from YouTube, TikTok, Instagram, X (Twitter), Snapchat or Pinterest.")
 
+    if req.mode == "info" and is_youtube(link):
+        try:
+            if not RAPIDAPI_KEY:
+                return JSONResponse({"items": [], "qualities": [], "error": "YouTube service is not configured."}, headers={"Cache-Control": "no-store"})
+            qualities = await asyncio.to_thread(youtube_available_qualities, link)
+            return JSONResponse({"items": [], "qualities": qualities}, headers={"Cache-Control": "no-store"})
+        except Exception as e:
+            print(f"[toolora] youtube quality lookup failed {link[:120]}: {ANSI.sub('', str(e))[:300]}", flush=True)
+            return JSONResponse({"items": [], "qualities": []}, headers={"Cache-Control": "no-store"})
+
     if req.mode == "info":  # never an error: an empty list simply means "use the normal single-video download"
         items: list = []
         if is_instagram(link) or is_tiktok(link):
@@ -1419,7 +1458,7 @@ async def download(req: Req, request: Request):
     cleanup = BackgroundTask(shutil.rmtree, folder, ignore_errors=True)
     try:
         async with slots:
-            path = await asyncio.to_thread(fetch, link, folder, req.mode)
+            path = await asyncio.to_thread(fetch, link, folder, req.mode, req.quality)
     except Exception as e:
         shutil.rmtree(folder, ignore_errors=True)
         print(f"[toolora] download failed ({req.mode}) {link[:120]}: {ANSI.sub('', str(e))[:600]}", flush=True)
