@@ -928,7 +928,7 @@ class _PublicRedirect(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-def _save_file(u: str, path: str) -> None:
+def _save_file(u: str, path: str, once: bool = False) -> None:
     """Download the finished file. Some links are picky about headers or need a few seconds to become ready,
     so each attempt uses a different set of headers and a few retries are allowed."""
     if not _public_https(u):
@@ -950,7 +950,7 @@ def _save_file(u: str, path: str) -> None:
             got = 0
             with urllib.request.build_opener(_PublicRedirect()).open(req, timeout=45) as r, open(path, "wb") as fh:
                 while True:
-                    chunk = r.read(1 << 16)
+                    chunk = r.read(1 << 20)
                     if not chunk:
                         break
                     got += len(chunk)
@@ -967,6 +967,8 @@ def _save_file(u: str, path: str) -> None:
             except Exception:
                 pass
             last = RuntimeError(f"HTTP {e.code} from {host} {body}".strip())
+            if once and e.code == 404:  # quick readiness check: report "not ready yet" at once
+                break
             if e.code not in (401, 403, 404, 409, 423, 425, 429, 500, 502, 503):
                 break
         except urllib.error.URLError as e:
@@ -1078,12 +1080,15 @@ def _save_when_ready(u: str, path: str, wait: int = 100) -> None:
     deadline = time.monotonic() + wait
     while True:
         try:
-            _save_file(u, path)
+            _save_file(u, path, once=True)  # one quick check per round instead of six slow retries
             return
         except Exception as e:
-            if "HTTP 404" not in str(e) or time.monotonic() > deadline:
+            if "HTTP 404" not in str(e):
+                _save_file(u, path)  # not a "not ready" answer: use the normal retries once
+                return
+            if time.monotonic() > deadline:
                 raise
-            time.sleep(4)
+            time.sleep(1.5)
 
 
 def rapid_video_fast(url: str, vid: str, folder: str) -> str:
