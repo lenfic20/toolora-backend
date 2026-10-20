@@ -1140,8 +1140,7 @@ RAPIDAPI_FAST_MAX_HEIGHT = int(os.getenv("RAPIDAPI_FAST_MAX_HEIGHT", "1080"))
 def _save_when_ready(u: str, path: str, wait: int = 100) -> None:
     """The fast service prepares the file on its own server; the link answers 404 until it is ready."""
     deadline = time.monotonic() + wait
-    time.sleep(5)  # give the service 5 seconds to prepare the file, then fetch it
-    while True:
+    while True:  # check at once (no fixed wait) and again every second until the file is ready
         try:
             _save_file(u, path, once=True)  # one quick check per round instead of six slow retries
             return
@@ -1151,16 +1150,22 @@ def _save_when_ready(u: str, path: str, wait: int = 100) -> None:
                 return
             if time.monotonic() > deadline:
                 raise
-            time.sleep(1.5)
+            time.sleep(1)
+
+
+_YT_QUALITY_CACHE: dict[str, tuple[float, list]] = {}  # video id -> (time, the service's raw quality list)
 
 
 def rapid_video_fast(url: str, vid: str, folder: str, quality: str | None = None) -> str:
     """Video from youtube-video-fast-downloader-24-7. Its file links live on the API's own server,
     so they are not locked to the API's IP like raw googlevideo.com links (those give HTTP 403 from Render)."""
-    opts = _rapid_json(f"/get_available_quality/{quote(vid)}", host=RAPIDAPI_FAST_HOST)
-    if isinstance(opts, dict) and isinstance(opts.get("url"), str) and not any(isinstance(v, list) for v in opts.values()):
-        raise RuntimeError("RapidAPI fast video: unexpected answer " + json.dumps(opts)[:160])
-    items = opts if isinstance(opts, list) else next((v for v in opts.values() if isinstance(v, list)), []) if isinstance(opts, dict) else []
+    hit = _YT_QUALITY_CACHE.get(vid) if quality else None
+    items = hit[1] if hit and time.time() - hit[0] < 600 and any(isinstance(i, dict) and str(i.get("id")) == str(quality) for i in hit[1]) else None
+    if items is None:  # the website fetched this list a moment ago when it showed the quality buttons; otherwise ask the service
+        opts = _rapid_json(f"/get_available_quality/{quote(vid)}", host=RAPIDAPI_FAST_HOST)
+        if isinstance(opts, dict) and isinstance(opts.get("url"), str) and not any(isinstance(v, list) for v in opts.values()):
+            raise RuntimeError("RapidAPI fast video: unexpected answer " + json.dumps(opts)[:160])
+        items = opts if isinstance(opts, list) else next((v for v in opts.values() if isinstance(v, list)), []) if isinstance(opts, dict) else []
     cap = MAX_MB * 1024 * 1024
     cands = []
     for it in items:
@@ -1269,6 +1274,10 @@ def youtube_available_qualities(url: str) -> list[dict]:
     vid = yt_video_id(url)
     data = _rapid_json(f"/get_available_quality/{quote(vid)}", host=RAPIDAPI_FAST_HOST)
     items = data if isinstance(data, list) else next((v for v in data.values() if isinstance(v, list)), []) if isinstance(data, dict) else []
+    if items:
+        if len(_YT_QUALITY_CACHE) > 200:
+            _YT_QUALITY_CACHE.clear()
+        _YT_QUALITY_CACHE[vid] = (time.time(), items)
     out, seen = [], set()
     cap = MAX_MB * 1024 * 1024
     for it in items:
