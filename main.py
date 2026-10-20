@@ -1225,15 +1225,157 @@ def youtube_available_qualities(url: str) -> list[dict]:
     return out
 
 
+# ---- YouTube through Social Download All-in-One RapidAPI ----
+RAPIDAPI_SOCIAL_HOST = os.getenv("RAPIDAPI_SOCIAL_HOST", "social-download-all-in-one.p.rapidapi.com").strip()
+
+
+def _social_autolink(url: str) -> dict:
+    """Ask the RapidAPI autolink endpoint for media links; use a short timeout for quick metadata fetches."""
+    body = json.dumps({"url": url}).encode("utf-8")
+    req = urllib.request.Request(
+        "https://" + RAPIDAPI_SOCIAL_HOST + "/v1/social/autolink",
+        data=body,
+        method="POST",
+        headers={
+            "x-rapidapi-key": RAPIDAPI_KEY,
+            "x-rapidapi-host": RAPIDAPI_SOCIAL_HOST,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": UA,
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=35) as response:
+            payload = json.loads(response.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        body_text = ""
+        try:
+            body_text = e.read().decode("utf-8", "replace")[:180]
+        except Exception:
+            pass
+        raise RuntimeError(f"Social Download API HTTP {e.code}: {body_text}".strip())
+    if not isinstance(payload, dict):
+        raise RuntimeError("Social Download API returned an unexpected response")
+    if payload.get("error") or payload.get("success") is False or payload.get("status") is False:
+        raise RuntimeError(str(payload.get("message") or payload.get("error") or "Social Download API failed")[:180])
+    return payload
+
+
+def _social_media_items(data: dict) -> list[dict]:
+    """Normalize common autolink response shapes without assuming a single provider schema."""
+    found = []
+    def walk(obj):
+        if isinstance(obj, dict):
+            url = next((obj.get(k) for k in ("url", "link", "download", "downloadUrl", "download_url", "src")
+                        if isinstance(obj.get(k), str) and obj.get(k).startswith("https://")), None)
+            if url:
+                found.append({**obj, "_url": url})
+            for value in obj.values():
+                if isinstance(value, (dict, list)):
+                    walk(value)
+        elif isinstance(obj, list):
+            for value in obj:
+                walk(value)
+    walk(data)
+    out, seen = [], set()
+    for item in found:
+        u = item["_url"]
+        path = urlparse(u).path.lower()
+        if (u not in seen and not is_youtube(u)
+                and not re.search(r"\.(jpe?g|png|webp|gif|svg)(?:$|\?)", path)
+                and _public_https(u)):
+            seen.add(u)
+            out.append(item)
+    return out
+
+
+def _social_is_audio(item: dict) -> bool:
+    desc = " ".join(str(item.get(k) or "") for k in ("type", "mimeType", "mime_type", "extension", "ext", "quality", "label", "format")).lower()
+    return "audio" in desc or any(x in desc for x in (".mp3", "audio/mpeg", "audio/mp4", "audio/webm"))
+
+
+def _social_quality_label(item: dict) -> str:
+    for key in ("quality", "qualityLabel", "label", "resolution", "height", "format"):
+        value = item.get(key)
+        if value not in (None, ""):
+            label = str(value).strip()
+            if key == "height" and label.isdigit():
+                label += "p"
+            return label[:45]
+    return str(item.get("type") or "Video")[:45]
+
+
+def social_youtube_qualities(url: str) -> list[dict]:
+    data = _social_autolink(url)
+    items = _social_media_items(data)
+    result, seen = [], set()
+    for index, item in enumerate(items):
+        if _social_is_audio(item):
+            continue
+        label = _social_quality_label(item)
+        key = str(index)
+        if label.lower() not in seen:
+            seen.add(label.lower())
+            result.append({"id": "social:" + key, "height": _height(item) if "_height" in globals() else 0, "label": label})
+    # Keep the API's order: it commonly ranks its best quality first.
+    return result
+
+
+def _fetch_youtube_social(url: str, folder: str, mode: str, quality: str | None = None) -> str:
+    if not _rapid_quota_ok("social", RAPIDAPI_VIDEO_DAILY):
+        raise RuntimeError("daily RapidAPI limit reached")
+    data = _social_autolink(url)
+    items = _social_media_items(data)
+    if not items:
+        raise RuntimeError("Social Download API returned no usable media links")
+    title = str(data.get("title") or data.get("name") or "YouTube")
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", title).strip("._")[:80] or "YouTube"
+    if mode == "audio":
+        chosen = next((x for x in items if _social_is_audio(x)), None)
+        if chosen:
+            ext = str(chosen.get("extension") or chosen.get("ext") or "mp3").lower().lstrip(".")
+            if ext not in ("mp3", "m4a", "aac", "webm", "ogg", "wav"): ext = "mp3"
+            path = os.path.join(folder, f"{stem}_{yt_video_id(url)}.{ext}")
+            _save_file(chosen["_url"], path)
+            return path
+        # Some autolink responses provide video links only; extract audio locally in that case.
+        chosen = next((x for x in items if not _social_is_audio(x)), None)
+        if not chosen:
+            raise RuntimeError("Social Download API did not provide audio or video media")
+        temp = os.path.join(folder, "source_media.bin")
+        _save_file(chosen["_url"], temp)
+        path = os.path.join(folder, f"{stem}_{yt_video_id(url)}.mp3")
+        r = subprocess.run(["ffmpeg", "-y", "-i", temp, "-vn", "-codec:a", "libmp3lame", "-q:a", "2", path], capture_output=True, timeout=150)
+        if r.returncode != 0 or not os.path.exists(path) or os.path.getsize(path) < 1000:
+            raise RuntimeError("could not extract audio from the returned video")
+        return path
+    videos = [(i, item) for i, item in enumerate(items) if not _social_is_audio(item)]
+    if quality and quality.startswith("social:"):
+        try: target_index = int(quality.split(":", 1)[1])
+        except ValueError: target_index = -1
+        chosen = next((item for i, item in videos if i == target_index), None)
+        if chosen is None:
+            raise RuntimeError("The selected YouTube quality is no longer available. Fetch qualities again.")
+    else:
+        chosen = videos[0][1] if videos else None
+    if not chosen:
+        raise RuntimeError("Social Download API did not provide a video link")
+    ext = str(chosen.get("extension") or chosen.get("ext") or "mp4").lower().lstrip(".")
+    if ext not in ("mp4", "webm", "m4v", "mov"): ext = "mp4"
+    path = os.path.join(folder, f"{stem}_{yt_video_id(url)}.{ext}")
+    _save_file(chosen["_url"], path)
+    return path
+
+
 def fetch_youtube(url: str, folder: str, mode: str, quality: str | None = None) -> str:
-    """YouTube is served only by RapidAPI (no yt-dlp)."""
+    """YouTube downloads use the Social Download All-in-One RapidAPI endpoint."""
     if not RAPIDAPI_KEY:
         raise RuntimeError("YouTube downloads are not available right now (RAPIDAPI_KEY is not configured).")
     try:
-        return rapid_audio(url, folder) if mode == "audio" else rapid_video(url, folder, quality)
+        return _fetch_youtube_social(url, folder, mode, quality)
     except Exception as e:
         detail = re.sub(r"\s+", " ", ANSI.sub("", str(e))).strip()
-        print(f"[toolora] rapidapi {mode} failed {url[:120]}: {detail[:500]}", flush=True)
+        print(f"[toolora] social rapidapi {mode} failed {url[:120]}: {detail[:500]}", flush=True)
         clear_folder(folder)
         low = detail.lower()
         if ("daily" in low and "limit" in low) or "http 429" in low:
@@ -1437,7 +1579,7 @@ async def download(req: Req, request: Request):
         try:
             if not RAPIDAPI_KEY:
                 return JSONResponse({"items": [], "qualities": [], "error": "YouTube service is not configured."}, headers={"Cache-Control": "no-store"})
-            qualities = await asyncio.to_thread(youtube_available_qualities, link)
+            qualities = await asyncio.to_thread(social_youtube_qualities, link)
             return JSONResponse({"items": [], "qualities": qualities}, headers={"Cache-Control": "no-store"})
         except Exception as e:
             print(f"[toolora] youtube quality lookup failed {link[:120]}: {ANSI.sub('', str(e))[:300]}", flush=True)
