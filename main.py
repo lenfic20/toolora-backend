@@ -1227,10 +1227,18 @@ def youtube_available_qualities(url: str) -> list[dict]:
 
 # ---- YouTube through Social Download All-in-One RapidAPI ----
 RAPIDAPI_SOCIAL_HOST = os.getenv("RAPIDAPI_SOCIAL_HOST", "social-download-all-in-one.p.rapidapi.com").strip()
+# Cache API metadata briefly so choosing a quality doesn't repeat the same slow API lookup.
+_SOCIAL_INFO_CACHE: dict[str, tuple[float, dict]] = {}
+_SOCIAL_INFO_CACHE_TTL = 45.0
 
 
 def _social_autolink(url: str) -> dict:
-    """Ask the RapidAPI autolink endpoint for media links; use a short timeout for quick metadata fetches."""
+    """Get media metadata quickly, reusing a recent response for the same normalized video URL."""
+    cache_key = normalize_url(url)
+    cached = _SOCIAL_INFO_CACHE.get(cache_key)
+    now = time.monotonic()
+    if cached and now - cached[0] < _SOCIAL_INFO_CACHE_TTL:
+        return cached[1]
     body = json.dumps({"url": url}).encode("utf-8")
     req = urllib.request.Request(
         "https://" + RAPIDAPI_SOCIAL_HOST + "/v1/social/autolink",
@@ -1245,7 +1253,7 @@ def _social_autolink(url: str) -> dict:
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=35) as response:
+        with urllib.request.urlopen(req, timeout=8) as response:
             payload = json.loads(response.read().decode("utf-8", "replace"))
     except urllib.error.HTTPError as e:
         body_text = ""
@@ -1258,6 +1266,11 @@ def _social_autolink(url: str) -> dict:
         raise RuntimeError("Social Download API returned an unexpected response")
     if payload.get("error") or payload.get("success") is False or payload.get("status") is False:
         raise RuntimeError(str(payload.get("message") or payload.get("error") or "Social Download API failed")[:180])
+    _SOCIAL_INFO_CACHE[cache_key] = (time.monotonic(), payload)
+    # Keep this tiny process-local cache bounded.
+    if len(_SOCIAL_INFO_CACHE) > 128:
+        oldest = min(_SOCIAL_INFO_CACHE, key=lambda key: _SOCIAL_INFO_CACHE[key][0])
+        _SOCIAL_INFO_CACHE.pop(oldest, None)
     return payload
 
 
