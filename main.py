@@ -929,7 +929,7 @@ class _PublicRedirect(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-def _save_file(u: str, path: str, once: bool = False) -> None:
+def _save_file(u: str, path: str, once: bool = False, request_timeout: int = 45) -> None:
     """Download the finished file. Some links are picky about headers or need a few seconds to become ready,
     so each attempt uses a different set of headers and a few retries are allowed."""
     if not _public_https(u):
@@ -949,7 +949,7 @@ def _save_file(u: str, path: str, once: bool = False) -> None:
         try:
             req = urllib.request.Request(u, headers=variants[attempt % len(variants)])
             got = 0
-            with urllib.request.build_opener(_PublicRedirect()).open(req, timeout=45) as r, open(path, "wb") as fh:
+            with urllib.request.build_opener(_PublicRedirect()).open(req, timeout=request_timeout) as r, open(path, "wb") as fh:
                 while True:
                     chunk = r.read(1 << 20)
                     if not chunk:
@@ -1076,13 +1076,13 @@ RAPIDAPI_FAST_HOST = os.getenv("RAPIDAPI_FAST_VIDEO_HOST", "youtube-video-fast-d
 RAPIDAPI_FAST_MAX_HEIGHT = int(os.getenv("RAPIDAPI_FAST_MAX_HEIGHT", "1080"))
 
 
-def _save_when_ready(u: str, path: str, wait: int = 100) -> None:
-    """The fast service prepares the file on its own server; the link answers 404 until it is ready."""
+def _save_when_ready(u: str, path: str, wait: int = 12) -> None:
+    """Check the provider-prepared file quickly; do not leave a request polling for a minute."""
     deadline = time.monotonic() + wait
-    time.sleep(5)  # give the service 5 seconds to prepare the file, then fetch it
+    time.sleep(1)  # start checking promptly rather than sleeping a fixed five seconds
     while True:
         try:
-            _save_file(u, path, once=True)  # one quick check per round instead of six slow retries
+            _save_file(u, path, once=True, request_timeout=4)  # bounded readiness check
             return
         except Exception as e:
             if "HTTP 404" not in str(e):
@@ -1090,13 +1090,13 @@ def _save_when_ready(u: str, path: str, wait: int = 100) -> None:
                 return
             if time.monotonic() > deadline:
                 raise
-            time.sleep(1.5)
+            time.sleep(0.5)
 
 
 def rapid_video_fast(url: str, vid: str, folder: str, quality: str | None = None) -> str:
     """Video from youtube-video-fast-downloader-24-7. Its file links live on the API's own server,
     so they are not locked to the API's IP like raw googlevideo.com links (those give HTTP 403 from Render)."""
-    opts = _rapid_json(f"/get_available_quality/{quote(vid)}", host=RAPIDAPI_FAST_HOST)
+    opts = _rapid_json(f"/get_available_quality/{quote(vid)}", timeout=10, host=RAPIDAPI_FAST_HOST)
     if isinstance(opts, dict) and isinstance(opts.get("url"), str) and not any(isinstance(v, list) for v in opts.values()):
         raise RuntimeError("RapidAPI fast video: unexpected answer " + json.dumps(opts)[:160])
     items = opts if isinstance(opts, list) else next((v for v in opts.values() if isinstance(v, list)), []) if isinstance(opts, dict) else []
@@ -1125,7 +1125,7 @@ def rapid_video_fast(url: str, vid: str, folder: str, quality: str | None = None
     errors = []
     for mp4, h, it in cands[:1] if quality else cands[:2]:
         try:
-            data = _rapid_json(f"/{kind}/{quote(vid)}?quality={quote(str(it['id']))}", host=RAPIDAPI_FAST_HOST)
+            data = _rapid_json(f"/{kind}/{quote(vid)}?quality={quote(str(it['id']))}", timeout=10, host=RAPIDAPI_FAST_HOST)
             link = data.get("file") if isinstance(data, dict) else None
             if not isinstance(link, str) or not link.startswith("http"):
                 link = _find_link(data)
@@ -1206,7 +1206,7 @@ def _rapid_video_raw(vid: str, folder: str) -> str:
 def youtube_available_qualities(url: str) -> list[dict]:
     """Return the available video qualities quickly, without preparing/downloading media."""
     vid = yt_video_id(url)
-    data = _rapid_json(f"/get_available_quality/{quote(vid)}", host=RAPIDAPI_FAST_HOST)
+    data = _rapid_json(f"/get_available_quality/{quote(vid)}", timeout=10, host=RAPIDAPI_FAST_HOST)
     items = data if isinstance(data, list) else next((v for v in data.values() if isinstance(v, list)), []) if isinstance(data, dict) else []
     out, seen = [], set()
     cap = MAX_MB * 1024 * 1024
