@@ -648,7 +648,7 @@ def info_items(url: str) -> list[dict]:
         return hit[1]
     url = normalize_url(key)
     try:  # TikTok keeps the original link: its /photo/ page is the one that lists the pictures
-        items = instagram_items(url) if is_instagram(url) else tiktok_items(key)
+        items = instagram_items(url) if is_instagram(url) else snapchat_items(key) if is_snapchat(url) else tiktok_items(key)
     except Exception as e:
         print(f"[toolora] slides info failed {key[:120]}: {ANSI.sub('', str(e))[:300]}", flush=True)
         items = []
@@ -728,6 +728,67 @@ def snap_video_urls(page: str) -> list[str]:
     found += re.findall(r'"contentUrl"\s*:\s*"(https?://[^"]+)"', t)
     found += [x for x in re.findall(r'(https?://[A-Za-z0-9.-]*sc-cdn\.net/[^"\'\s<>\\]+)', t) if ".mp4" in urlparse(x).path.lower()]
     return [x for x in _uniq(found) if media_ok(x)]
+
+
+def _snap_kind(snap: dict, u: str) -> str:
+    t = str((snap or {}).get("snapMediaType") or "").upper()
+    if "IMAGE" in t or "PHOTO" in t or t == "0":
+        return "image"
+    if "VIDEO" in t or t == "1":
+        return "video"
+    return "image" if urlparse(u).path.lower().endswith(IMAGE_EXT) else "video"
+
+
+def _snap_probe(u: str) -> bool:
+    """True when the file can really be fetched (reads 2 bytes only)."""
+    try:
+        referer = "https://www.snapchat.com/"
+        req = urllib.request.Request(u, headers={"User-Agent": UA, "Referer": referer, "Range": "bytes=0-1", "Accept": "*/*"})
+        handlers = [_CheckRedirect()]
+        if OUT_PROXY:
+            handlers.append(urllib.request.ProxyHandler({"http": OUT_PROXY, "https": OUT_PROXY}))
+        with urllib.request.build_opener(*handlers).open(req, timeout=8) as r:
+            return r.status in (200, 206)
+    except Exception:
+        return False
+
+
+def snapchat_items(url: str) -> list[dict]:
+    """Every picture / video of a Snapchat post (a story can hold several), in order, as [{"kind", "src"}].
+    Videos use the watermark-free variant when Snapchat serves it. One item or none: the normal single download is used."""
+    url = snap_resolve(url)
+    text = page_text(url)
+    if not text:
+        return []
+    m = re.search(r'<script[^>]+id="__NEXT_DATA__"[^>]*>(.*?)</script>', text, re.S)
+    snaps: list[tuple[str, dict]] = []
+    if m:
+        try:
+            props = json.loads(m.group(1))["props"]["pageProps"]
+            want = re.search(r"/spotlight/([\w-]+)", urlparse(url).path)
+            want = want.group(1) if want else None
+            stories = ((props.get("spotlightFeed") or {}).get("spotlightStories")) or []
+            picked = [s for s in stories if want and (((s or {}).get("story") or {}).get("storyId") or {}).get("value") == want]
+            if not picked and not want:
+                picked = [s for s in stories if ((s or {}).get("story") or {}).get("snapList")][:1]
+            for s in picked:
+                for snap in ((s.get("story") or {}).get("snapList") or []):
+                    mu = ((snap or {}).get("snapUrls") or {}).get("mediaUrl")
+                    if isinstance(mu, str) and media_ok(mu):
+                        snaps.append((mu, snap))
+        except (ValueError, KeyError, TypeError, AttributeError):
+            snaps = []
+    items, seen = [], set()
+    for mu, snap in snaps:
+        if mu in seen:
+            continue
+        seen.add(mu)
+        kind = _snap_kind(snap, mu)
+        src = mu
+        if kind == "video":
+            src = next((c for c in snap_clean_urls(mu) if media_ok(c) and _snap_probe(c)), mu)
+        items.append({"kind": kind, "src": src})
+    return items
 
 
 def snapchat_fallback(url: str, folder: str, mode: str, clean_only: bool = False) -> str:
@@ -1445,7 +1506,7 @@ async def download(req: Req, request: Request):
 
     if req.mode == "info":  # never an error: an empty list simply means "use the normal single-video download"
         items: list = []
-        if is_instagram(link) or is_tiktok(link):
+        if is_instagram(link) or is_tiktok(link) or is_snapchat(link):
             try:
                 async with slots:
                     items = await asyncio.wait_for(asyncio.to_thread(info_items, link), 45)
