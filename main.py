@@ -307,6 +307,18 @@ def title_hook(folder: str, title_first: bool = False):
     return hook
 
 
+def has_audio(path: str):
+    """True / False when the file has / has no sound track; None when that can't be checked (then the file is trusted)."""
+    try:
+        r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=codec_type", "-of", "csv=p=0", path],
+                           capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    return bool(r.stdout.strip())
+
+
 def _tag(items: list, title) -> list:
     t = clean_title(title)
     if t:
@@ -944,7 +956,7 @@ def attempts_for(mode: str, url: str) -> list[dict]:
                    {"format": "best"}]
     if is_instagram(url):
         # Default web API first, then the iOS-app API, then plain "best" as a last format.
-        first = {"format": "b[ext=mp4]/bv*+ba/b", "format_sort": SORT} if mode == "video" else formats[0]
+        first = {"format": "bv*+ba/b", "format_sort": SORT} if mode == "video" else formats[0]  # separate video + audio streams are joined, so the sound is never left out
         out = [first, {**first, "extractor_args": {"instagram": {"app_id": ["ios"]}}}]
         if mode == "video":
             out.append(formats[-1])
@@ -1483,6 +1495,7 @@ def fetch(url: str, folder: str, mode: str = "video", quality: str | None = None
     try:
         capped = False  # a download that finished without a file means the size cap was hit
         started, blocked = time.monotonic(), 0
+        silent_tried, silent_kept = set(), None  # a video that came out without sound is kept aside while other methods are tried
         for extra in attempts_for(mode, url):
             if last is not None and time.monotonic() - started > BUDGET:
                 break  # stop trying new methods; the visitor gets the last reason instead of an endless spinner
@@ -1490,6 +1503,9 @@ def fetch(url: str, folder: str, mode: str = "video", quality: str | None = None
             extra = {k: v for k, v in extra.items() if k != "_lower"}
             if lower and not capped and "requested format" not in str(last or "").lower():
                 continue  # smaller versions only help with size or format problems, not with blocks
+            attempt_key = json.dumps(extra, sort_keys=True, default=str)
+            if attempt_key in silent_tried:
+                continue  # this exact method already gave a video with no sound
             clear_folder(folder)
             try:
                 with yt_dlp.YoutubeDL({**base, **extra}) as ydl:
@@ -1508,8 +1524,22 @@ def fetch(url: str, folder: str, mode: str = "video", quality: str | None = None
                 continue
             path = pick_file(folder, mode)
             if path:
+                if mode == "video" and path.lower().endswith((".mp4", ".mkv", ".webm", ".mov")) and has_audio(path) is False:
+                    silent_tried.add(attempt_key)
+                    if silent_kept is None:  # keep the first silent copy; if no method finds the sound, it is still better than nothing
+                        keep_dir = tempfile.mkdtemp(prefix="silent_")
+                        silent_kept = (shutil.move(path, os.path.join(keep_dir, os.path.basename(path))), read_title(folder))
+                    continue
+                if silent_kept:
+                    shutil.rmtree(os.path.dirname(silent_kept[0]), ignore_errors=True)
                 return path
             capped = True
+        if silent_kept:  # no method produced a version with sound (the post may simply have none): hand back the silent video
+            clear_folder(folder)
+            back = shutil.move(silent_kept[0], os.path.join(folder, os.path.basename(silent_kept[0])))
+            shutil.rmtree(os.path.dirname(silent_kept[0]), ignore_errors=True)
+            save_title(folder, silent_kept[1])
+            return back
         if insta:
             clear_folder(folder)
             try:
